@@ -1,0 +1,30 @@
+{
+  "name": "stream-plugin-engine",
+  "version": "0.1.0",
+  "description": "Lightweight, cross-platform JavaScript/TypeScript plugin engine for a future media/streaming application.",
+  "keywords": [
+    "plugin",
+    "engine",
+    "streaming",
+    "typescript"
+  ],
+  "license": "GPL-3.0-only",
+  "type": "module",
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "files": [
+    "dist/src"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "clean": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true });\"",
+    "test": "npm run build && node --test dist/tests/"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.0"
+  }
+}
