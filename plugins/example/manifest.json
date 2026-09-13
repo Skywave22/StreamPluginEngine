@@ -1,0 +1,11 @@
+{
+  "id": "example.source",
+  "name": "Example Source",
+  "version": "1.0.0",
+  "author": "StreamPluginEngine",
+  "description": "Example plugin used to verify discovery and loading.",
+  "entry": "plugin.js",
+  "domains": [
+    "example.com"
+  ]
+}
