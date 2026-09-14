@@ -6,8 +6,15 @@
  * engine from the host Node.js process: the plugin realm contains no
  * Node.js globals, no host objects, and no built-in modules. Plugins
  * communicate with the host exclusively through the controlled
- * PluginContext (manifest + log) and by returning JSON-serializable
- * values.
+ * PluginContext (manifest + log + http) and by returning
+ * JSON-serializable values.
+ *
+ * Phase 4 adds the controlled HTTP capability: `context.http.get` /
+ * `context.http.getJson` / `context.http.request`. The host functions
+ * return guest promises (deferred promises); the actual network I/O
+ * happens host-side in HttpClient (src/http.ts) and the settled,
+ * validated result is bridged back into the guest. Plugins never touch
+ * Node networking directly.
  *
  * Isolation model and its limits:
  * - Each loaded plugin gets its own QuickJS runtime (separate heap).
@@ -15,6 +22,8 @@
  *   interrupted by a deadline (timeoutMs) via QuickJS interrupt hooks.
  * - Module imports are resolved ONLY inside the plugin's own directory;
  *   host/built-in/absolute imports are rejected.
+ * - Networking is only possible through context.http, which the engine
+ *   validates and bounds (scheme, timeout, size, redirects, headers).
  * - This is in-process, engine-level isolation — NOT an OS-level
  *   security boundary. A plugin is untrusted code constrained by the
  *   engine, not by the operating system. See ARCHITECTURE.md.
@@ -29,11 +38,14 @@ import path from "node:path";
 import { getQuickJS, shouldInterruptAfterDeadline } from "quickjs-emscripten";
 import type {
   QuickJSContext,
+  QuickJSDeferredPromise,
   QuickJSHandle,
   QuickJSRuntime,
   QuickJSWASMModule,
 } from "quickjs-emscripten";
 
+import { HttpClient, HttpError } from "./http.js";
+import type { HttpRequestOptions, HttpErrorObject } from "./http.js";
 import type {
   LoadedPlugin,
   Plugin,
@@ -94,6 +106,15 @@ class LoadedPluginHandle implements LoadedPlugin {
   readonly runtime: QuickJSRuntime;
   readonly context: QuickJSContext;
   readonly capabilityFns: Map<string, QuickJSHandle>;
+  /**
+   * In-flight host HTTP requests owned by this plugin's operations.
+   * Aborted when an operation ends or the plugin is disposed, so a
+   * cancelled/finished execution never leaves an uncontrolled request
+   * running.
+   */
+  readonly inFlightHttp = new Set<AbortController>();
+  /** Set when the guest environment has been (or is being) disposed. */
+  disposed = false;
 
   constructor(
     manifest: PluginManifest,
@@ -111,6 +132,11 @@ class LoadedPluginHandle implements LoadedPlugin {
   }
 
   dispose(): void {
+    this.disposed = true;
+    for (const controller of this.inFlightHttp) {
+      controller.abort(new Error("plugin disposed"));
+    }
+    this.inFlightHttp.clear();
     for (const fn of this.capabilityFns.values()) {
       fn.dispose();
     }
@@ -126,6 +152,7 @@ export class PluginRuntime {
   private readonly timeoutMs: number;
   private readonly memoryLimitBytes: number;
   private readonly logger: (pluginId: string, message: string) => void;
+  private readonly httpClient: HttpClient;
   private readonly loaded = new Set<LoadedPluginHandle>();
 
   constructor(options: PluginRuntimeOptions = {}) {
@@ -134,6 +161,7 @@ export class PluginRuntime {
     this.logger =
       options.logger ??
       ((pluginId, message) => console.log(`[plugin:${pluginId}] ${message}`));
+    this.httpClient = new HttpClient({ limits: options.http?.limits });
   }
 
   /**
@@ -360,12 +388,16 @@ export class PluginRuntime {
     runtime.setInterruptHandler(
       shouldInterruptAfterDeadline(Date.now() + this.timeoutMs),
     );
+    // Cancels this operation's host HTTP requests when the operation
+    // ends (success, error, or deadline) so nothing runs uncontrolled.
+    const opAbort = new AbortController();
+    handle.inFlightHttp.add(opAbort);
     try {
       const callArgs: QuickJSHandle[] = [];
       for (const arg of args) {
         callArgs.push(this.jsonToHandle(context, arg, tracked));
       }
-      const contextObject = this.buildPluginContext(context, handle, tracked);
+      const contextObject = this.buildPluginContext(context, handle, tracked, opAbort);
       callArgs.push(contextObject);
 
       const callResult = track(
@@ -403,6 +435,9 @@ export class PluginRuntime {
       return fail(this.toRuntimeError(error, "PLUGIN_RUNTIME_ERROR"));
     } finally {
       runtime.removeInterruptHandler();
+      // Abort any HTTP request still in flight for this operation.
+      opAbort.abort(new Error("operation ended"));
+      handle.inFlightHttp.delete(opAbort);
       for (const d of tracked) {
         if (d.alive) d.dispose();
       }
@@ -567,6 +602,7 @@ export class PluginRuntime {
     context: QuickJSContext,
     handle: LoadedPluginHandle,
     tracked: Disposable[],
+    opAbort: AbortController,
   ): QuickJSHandle {
     const contextObject = track(context.newObject(), tracked);
     const manifestHandle = this.jsonToHandle(context, handle.manifest, tracked);
@@ -592,9 +628,285 @@ export class PluginRuntime {
       this.logger(handle.pluginId, parts.join(" "));
     });
     track(logFn, tracked);
+
+    // context.http — the ONLY network surface a plugin has.
+    const httpObject = track(context.newObject(), tracked);
+    const getFn = track(
+      context.newFunction("get", (...callArgs: QuickJSHandle[]) =>
+        this.startHttpCall(handle, "get", callArgs, opAbort, tracked),
+      ),
+      tracked,
+    );
+    const getJsonFn = track(
+      context.newFunction("getJson", (...callArgs: QuickJSHandle[]) =>
+        this.startHttpCall(handle, "getJson", callArgs, opAbort, tracked),
+      ),
+      tracked,
+    );
+    const requestFn = track(
+      context.newFunction("request", (...callArgs: QuickJSHandle[]) =>
+        this.startHttpCall(handle, "request", callArgs, opAbort, tracked),
+      ),
+      tracked,
+    );
+    context.setProp(httpObject, "get", getFn);
+    context.setProp(httpObject, "getJson", getJsonFn);
+    context.setProp(httpObject, "request", requestFn);
+
     context.setProp(contextObject, "manifest", manifestHandle);
     context.setProp(contextObject, "log", logFn);
+    context.setProp(contextObject, "http", httpObject);
     return contextObject;
+  }
+
+  /**
+   * Synchronous entry point for a guest `context.http.*` call.
+   *
+   * Reads the guest arguments, creates a guest promise (deferred),
+   * schedules the host-side HTTP work, and returns the promise handle.
+   * quickjs-emscripten host functions must be synchronous (the sync
+   * Wasm variant has no asyncify), so all argument reading happens here
+   * and the network I/O runs later on the event loop.
+   */
+  private startHttpCall(
+    handle: LoadedPluginHandle,
+    operation: "get" | "getJson" | "request",
+    callArgs: QuickJSHandle[],
+    opAbort: AbortController,
+    tracked: Disposable[],
+  ): QuickJSHandle {
+    const context = handle.context;
+    const deferred = track(context.newPromise(), tracked);
+
+    let request: { url: string; options: HttpRequestOptions } | undefined;
+    let invalid: HttpErrorObject | undefined;
+
+    const readOptions = (h: QuickJSHandle | undefined): Record<string, unknown> | undefined => {
+      if (h === undefined) {
+        return undefined;
+      }
+      const kind = context.typeof(h);
+      if (kind === "undefined" || kind === "null") {
+        return undefined;
+      }
+      if (kind !== "object") {
+        invalid = {
+          code: "HTTP_INVALID_REQUEST",
+          message: "HTTP options must be a plain object",
+        };
+        return undefined;
+      }
+      const dumped = context.dump(h);
+      if (typeof dumped !== "object" || dumped === null || Array.isArray(dumped)) {
+        invalid = {
+          code: "HTTP_INVALID_REQUEST",
+          message: "HTTP options must be a plain object",
+        };
+        return undefined;
+      }
+      return dumped as Record<string, unknown>;
+    };
+
+    if (invalid === undefined) {
+      if (operation === "get" || operation === "getJson") {
+        const urlArg = callArgs[0];
+        if (urlArg === undefined || context.typeof(urlArg) !== "string") {
+          invalid = {
+            code: "HTTP_INVALID_REQUEST",
+            message: `${operation}(url) requires a URL string as its first argument`,
+          };
+        } else {
+          const url = context.getString(urlArg);
+          const options = readOptions(callArgs[1]);
+          if (invalid === undefined) {
+            if (options !== undefined && "url" in options) {
+              invalid = {
+                code: "HTTP_INVALID_REQUEST",
+                message: `${operation}(url, options) takes the URL as its first argument; 'options.url' is not allowed`,
+              };
+            } else if (options !== undefined && "method" in options) {
+              invalid = {
+                code: "HTTP_INVALID_REQUEST",
+                message: `${operation}() is always GET; use request() to choose a method`,
+              };
+            } else {
+              request = { url, options: options ?? {} };
+            }
+          }
+        }
+      } else {
+        const options = readOptions(callArgs[0]);
+        if (invalid === undefined) {
+          if (options === undefined) {
+            invalid = {
+              code: "HTTP_INVALID_REQUEST",
+              message: "request(options) requires an options object with a 'url'",
+            };
+          } else if (typeof options.url !== "string") {
+            invalid = {
+              code: "HTTP_INVALID_REQUEST",
+              message: "request(options) requires 'options.url' to be a string",
+            };
+          } else {
+            request = { url: options.url, options: options as HttpRequestOptions };
+          }
+        }
+      }
+    }
+
+    // Schedule the host-side work. The promise is always settled (or the
+    // operation ends first, which aborts the request and drains the
+    // guest), so the guest never sees an unhandled rejection.
+    if (request !== undefined) {
+      void this.finishHttpCall(handle, deferred, operation, request, opAbort.signal).catch(
+        () => {
+          // finishHttpCall never rejects; this is a defensive guard.
+        },
+      );
+    } else if (invalid !== undefined) {
+      void this.settleHttpError(handle, deferred, invalid).catch(() => {});
+    } else {
+      // Defensive: must not happen (exactly one of request/invalid is
+      // always set). Settle anyway so the guest promise never hangs.
+      void this.settleHttpError(
+        handle,
+        deferred,
+        { code: "HTTP_INVALID_REQUEST", message: "Invalid HTTP request" },
+      ).catch(() => {});
+    }
+
+    // Ownership: returning deferred.handle from a host function transfers
+    // the promise handle to the framework; settle/reject clean up the
+    // resolvers. The deferred itself stays tracked so a torn-down
+    // operation still releases it.
+    return deferred.handle;
+  }
+
+  /**
+   * Run one host-side HTTP request and bridge the validated result (or
+   * structured error) back into the guest promise.
+   *
+   * After settling, the guest's pending microtasks MUST be pumped:
+   * the promise reactions (and with them the capability's continuation)
+   * only run inside executePendingJobs.
+   */
+  private async finishHttpCall(
+    handle: LoadedPluginHandle,
+    deferred: QuickJSDeferredPromise,
+    operation: "get" | "getJson" | "request",
+    request: { url: string; options: HttpRequestOptions },
+    signal: AbortSignal,
+  ): Promise<void> {
+    let ok = true;
+    let payload: unknown;
+    let errorObject: HttpErrorObject = {
+      code: "HTTP_INTERNAL_ERROR",
+      message: "HTTP request failed",
+    };
+
+    try {
+      const response = await this.httpClient.request(request.url, request.options, signal);
+      if (operation === "getJson") {
+        try {
+          payload = JSON.parse(response.body) as unknown;
+        } catch {
+          ok = false;
+          errorObject = {
+            code: "HTTP_INVALID_JSON",
+            message: "Response body is not valid JSON",
+          };
+        }
+      } else {
+        payload = response;
+      }
+    } catch (error) {
+      ok = false;
+      if (error instanceof HttpError) {
+        errorObject = { code: error.code, message: error.message };
+      }
+    }
+
+    await this.settleHttpResult(handle, deferred, ok, payload, errorObject);
+  }
+
+  /** Settle the guest promise with a precomputed structured error. */
+  private async settleHttpError(
+    handle: LoadedPluginHandle,
+    deferred: QuickJSDeferredPromise,
+    errorObject: HttpErrorObject,
+  ): Promise<void> {
+    await this.settleHttpResult(handle, deferred, false, undefined, errorObject);
+  }
+
+  /**
+   * Convert the host-side result/error into a guest value, settle the
+   * deferred promise, and pump the guest so the capability resumes.
+   * No-ops (safely) if the plugin was disposed or the operation already
+   * tore the guest down.
+   */
+  private async settleHttpResult(
+    handle: LoadedPluginHandle,
+    deferred: QuickJSDeferredPromise,
+    ok: boolean,
+    payload: unknown,
+    errorObject: HttpErrorObject,
+  ): Promise<void> {
+    if (handle.disposed || !deferred.alive) {
+      return;
+    }
+    const localTracked: Disposable[] = [];
+    let settled = false;
+    try {
+      const context = handle.context;
+      const value = ok ? payload : errorObject;
+      const valueHandle = this.jsonToHandle(context, value, localTracked);
+      if (ok) {
+        deferred.resolve(valueHandle);
+      } else {
+        deferred.reject(valueHandle);
+      }
+      settled = true;
+      // Ownership: resolve/reject pass the handle to the guest promise
+      // machinery; the host-side handle is released here.
+      valueHandle.dispose();
+    } catch {
+      // The guest context vanished (plugin disposed) while the request
+      // was in flight. The operation is over; there is nothing to
+      // settle. The request itself is aborted by the operation's
+      // teardown.
+      return;
+    } finally {
+      for (const d of localTracked) {
+        if (d.alive) d.dispose();
+      }
+    }
+    if (settled) {
+      this.pumpJobsQuiet(handle, localTracked);
+    }
+  }
+
+  /**
+   * Pump guest jobs after a host-side promise settlement, WITHOUT
+   * rethrowing job errors. A job may throw (for example a continuation
+   * interrupted by the deadline); the error will surface through the
+   * capability's own promise, so the pump must keep draining the queue
+   * so the promise bridge can fire.
+   */
+  private pumpJobsQuiet(handle: LoadedPluginHandle, tracked: Disposable[]): void {
+    if (handle.disposed) {
+      return;
+    }
+    const runtime = handle.runtime;
+    while (!handle.disposed && runtime.hasPendingJob()) {
+      const jobs = track(runtime.executePendingJobs(), tracked);
+      if (jobs.error !== undefined) {
+        try {
+          handle.context.unwrapResult(jobs);
+        } catch {
+          // Guest job error: intentionally not rethrown here (see above).
+        }
+      }
+    }
   }
 
   /**
@@ -644,6 +956,13 @@ export class PluginRuntime {
       return { type: error.type, message: error.message };
     }
     if (error instanceof Error) {
+      // A guest that throws (or rejects with) a plain object such as an
+      // HTTP error {code, message} should surface it verbatim rather
+      // than as an opaque wrapper message.
+      const cause = (error as { cause?: unknown }).cause;
+      if (isStructuredErrorObject(cause)) {
+        return { type: fallback, message: `${cause.code}: ${cause.message}` };
+      }
       const detail = errorMessageDetail(error);
       if (/interrupted/i.test(detail)) {
         return {
@@ -683,6 +1002,24 @@ function isRuntimeErrorShape(
     value !== null &&
     "type" in value &&
     typeof (value as { type: unknown }).type === "string" &&
+    "message" in value &&
+    typeof (value as { message: unknown }).message === "string"
+  );
+}
+
+/**
+ * True for plain (non-Error) objects shaped like a structured error
+ * ({code, message}) — e.g. an HTTP error the guest threw uncaught.
+ */
+function isStructuredErrorObject(
+  value: unknown,
+): value is { code: string; message: string } {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !(value instanceof Error) &&
+    "code" in value &&
+    typeof (value as { code: unknown }).code === "string" &&
     "message" in value &&
     typeof (value as { message: unknown }).message === "string"
   );

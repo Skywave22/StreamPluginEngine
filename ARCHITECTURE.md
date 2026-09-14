@@ -1,8 +1,9 @@
 # Architecture (planned)
 
 Status: the layering below is the overall design. **Phases 1 (foundation),
-2 (plugin manifest + loader), and 3 (sandboxed plugin runtime) are
-implemented; everything else is still planned and not implemented.**
+2 (plugin manifest + loader), 3 (sandboxed plugin runtime), and 4
+(engine-controlled HTTP) are implemented; everything else is still planned
+and not implemented.**
 
 ## Layering
 
@@ -13,9 +14,10 @@ Plugin Engine
     ↓
 Plugin Runtime
     ↓
-Plugin API
+Plugin API            (implemented: manifest, log, http)
     ↓
 HTTP / HTML / JSON capabilities
+                      (implemented: HTTP + JSON response helper)
     ↓
 External websites
 ```
@@ -103,10 +105,10 @@ the tests and the `npm run plugins:list` CLI.
   ONLY to files inside the plugin's own directory; host/built-in
   (`node:*`), absolute, and escaping (`..`) imports are rejected.
 
-**Plugin JavaScript execution is implemented in Phase 3, but network and
-scraping APIs are intentionally not implemented in Phase 3.** There is no
-HTTP, no HTML parsing, no DOM, and no capability for a plugin to reach a
-website. Those belong to the Plugin API v1 capabilities in Phase 4.
+**Plugin JavaScript execution is implemented in Phase 3, but no network,
+scraping, or HTML APIs.** In Phase 3 the sandbox had no capability to reach
+a website at all. The engine-controlled HTTP capability is added in Phase 4
+(below); HTML parsing, DOM, and scraping remain deliberately unimplemented.
 
 Sandbox limitations (do not mistake engine isolation for OS isolation):
 
@@ -118,6 +120,77 @@ Sandbox limitations (do not mistake engine isolation for OS isolation):
 - Future hardening: per-plugin OS-level isolation and a
   capabilities-based Plugin API.
 
+### Phase 4 — Engine-controlled HTTP capability
+
+A plugin can now reach external websites, but **only** through a small,
+engine-moderated HTTP capability. The key architectural decision is that
+**the plugin never performs the network I/O itself**: the sandbox has no
+networking, and every request is executed on the host on the plugin's
+behalf, then reduced to a plain serializable object before re-entering the
+sandbox.
+
+Request flow:
+
+```
+Plugin code (QuickJS sandbox)
+    ↓  context.http.get(url, options)      ← the ONLY path to the network
+PluginContext.http  (thin guest function; returns a Promise)
+    ↓  (args serialized across the Wasm boundary)
+PluginRuntime (host)  — per-operation AbortController
+    ↓
+HttpClient (host)     — validate URL/headers, clamp limits, fetch,
+                        bounded read, redirect loop, size/timeout enforcement
+    ↓  Node fetch (undici)
+External website
+    ↑  response
+Normalized HttpResponse { status, statusText, headers, url, body }
+    ↓  (JSON-serialized back across the Wasm boundary)
+Plugin receives a plain object (or a structured { code, message } error)
+```
+
+- `context.http` (`src/types.ts`) — the guest surface: `get(url, options?)`,
+  `getJson(url, options?)`, and `request(options)` (any method). A response
+  is `{ status, statusText, headers, url, body }` — a number, strings, and
+  a plain header object. Nothing host-internal (no sockets, streams, or
+  `Buffer`) is ever handed to the sandbox.
+- `HttpClient` (`src/http.ts`) — the host implementation. It is a pure
+  TypeScript class built on Node's built-in `fetch` (undici) with no added
+  dependencies. It owns: URL/scheme validation, header validation, limit
+  clamping, timeout enforcement, bounded response reading, and the
+  re-validating redirect loop.
+- **Limits.** Plugin-supplied `timeoutMs`, `maxResponseBytes`, and
+  `maxRedirects` are clamped against hard engine maximums
+  (`DEFAULT_HTTP_LIMITS`): 30 s, 50 MiB, and 10 hops. The engine maximums
+  are overridable only at runtime construction
+  (`new PluginRuntime({ http: { limits } })`) — a plugin can never raise
+  them. Oversized responses abort the connection and reject with
+  `HTTP_RESPONSE_TOO_LARGE` without streaming the body into the guest.
+- **Errors.** Failures reject with a structured `{ code, message }` object
+  (see `HTTP_ERROR_CODES`), never a host stack trace. Examples:
+  `HTTP_TIMEOUT`, `HTTP_INVALID_URL`, `HTTP_UNSUPPORTED_SCHEME`,
+  `HTTP_RESPONSE_TOO_LARGE`, `HTTP_TOO_MANY_REDIRECTS`,
+  `HTTP_NETWORK_ERROR`, `HTTP_INVALID_JSON`.
+- **Security.** URLs must be absolute `http:`/`https:`; other schemes
+  (`file:`, `data:`, `javascript:`, `node:`, …) and relative URLs are
+  rejected. Each redirect hop is re-validated against the same policy and
+  counted. Headers are validated and a small engine default `User-Agent` is
+  set; host credentials/environment are never forwarded. There is **no**
+  CAPTCHA/Cloudflare/DRM/auth-bypass or other circumvention logic — this is
+  a plain, robust HTTP client only.
+- **Cancellation & concurrency.** Each executing operation gets its own
+  `AbortController`; when the operation's time limit trips or the plugin is
+  disposed, all of its in-flight HTTP requests are aborted on the host, so
+  nothing runs away. Concurrency is per-plugin by construction (one QuickJS
+  runtime per plugin); a per-plugin cap on simultaneous in-flight requests
+  is future work, not a global scheduler.
+
+**Deliberate non-provisions (Phase 4)** — intentionally NOT implemented, by
+design: browser automation (no Chromium/Playwright/Puppeteer), DOM/HTML
+parsing, CSS/XPath selection, scraping frameworks, in-page JS execution,
+stream/M3U8/media extraction, provider-specific logic, and any
+CAPTCHA/Cloudflare/DRM/proxy/auth-bypass capability. The engine performs
+plain HTTP only.
+
 ## Planned plugin entry-point types (not implemented)
 
 - Search
@@ -128,15 +201,14 @@ Sandbox limitations (do not mistake engine isolation for OS isolation):
 ## Planned engine features (not implemented)
 
 - Plugin enable/disable (the manager only has registry-level unregister)
-- HTTP requests (capability, with timeouts)
 - HTML parsing (capability)
-- JSON parsing (capability)
 - Parallel plugin execution with per-plugin timeouts
 - Testing and benchmarking hooks
 
 (Implemented so far: manifest schema + validation, discovery, loading,
 manager, sandboxed JavaScript execution, controlled context, per-operation
-timeouts, memory limits, and error isolation at the load/execute level.)
+timeouts, memory limits, error isolation at the load/execute level, and
+engine-controlled HTTP with limits, structured errors, and cancellation.)
 
 ## Design constraints
 
@@ -156,7 +228,9 @@ timeouts, memory limits, and error isolation at the load/execute level.)
 - **Phase 3** — Sandboxed plugin runtime (QuickJS/Wasm), plugin export
   contract, controlled context, timeouts, memory limits, error isolation,
   `plugin:run` CLI. *(complete)*
-- **Phase 4** — Plugin API v1 capabilities (HTTP, JSON, HTML), per-plugin
-  enable/disable; standard plugin entry points (search, details, episodes,
-  sources); parallel execution and timeouts.
+- **Phase 4** — Engine-controlled HTTP capability: `context.http`
+  (get/getJson/request), engine-enforced limits, structured error model,
+  redirect re-validation, cancellation on operation end. *(complete — HTTP
+  only; HTML parsing, enable/disable, standard entry points, and parallel
+  execution are deliberately deferred to later phases.)*
 - **Phase 5** — Testing and benchmarking tooling.

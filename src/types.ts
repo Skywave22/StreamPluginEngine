@@ -1,10 +1,16 @@
 /**
  * Core types for plugin manifests, plugins, and validation results.
  *
- * Phase 3: these types describe plugin metadata and the sandboxed
- * execution result types. Plugin code executes inside a QuickJS (Wasm)
- * runtime with a controlled API — see src/runtime.ts.
+ * Phase 4: these types describe plugin metadata, the sandboxed execution
+ * result types, and the controlled HTTP capability contract. Plugin code
+ * executes inside a QuickJS (Wasm) runtime with a controlled API — see
+ * src/runtime.ts and src/http.ts.
  */
+import type {
+  HttpLimits,
+  HttpRequestOptions,
+  HttpResponse,
+} from "./http.js";
 
 /**
  * A plugin manifest as declared in `<plugin dir>/manifest.json`.
@@ -87,6 +93,36 @@ export const KNOWN_CAPABILITIES = [
 export type KnownCapability = (typeof KNOWN_CAPABILITIES)[number];
 
 /**
+ * Controlled HTTP surface exposed to plugins as `context.http`.
+ *
+ * All methods return promises. Failures REJECT with a structured error
+ * object `{ code: HttpErrorCode, message: string }` — catch it in the
+ * plugin. Non-2xx status codes (404, 500, ...) are NOT errors: they
+ * resolve normally so the plugin can inspect status and body.
+ *
+ * The plugin performs networking ONLY through this surface; there is no
+ * direct access to Node networking, sockets, or an unrestricted fetch.
+ */
+export interface PluginHttp {
+  /**
+   * GET `url` with optional controlled options.
+   * Rejects with `{ code, message }` on transport-level failure.
+   */
+  get(url: string, options?: HttpRequestOptions): Promise<HttpResponse>;
+  /**
+   * GET `url` and parse the body as JSON. Rejects with
+   * `{ code: "HTTP_INVALID_JSON", message }` when the body is not valid
+   * JSON (in addition to the regular transport error codes).
+   */
+  getJson<T = unknown>(url: string, options?: HttpRequestOptions): Promise<T>;
+  /**
+   * Perform a GET or POST request described by `options` (which must
+   * include `url`). POST supports a string `body`.
+   */
+  request(options: HttpRequestOptions & { url: string }): Promise<HttpResponse>;
+}
+
+/**
  * Controlled context handed to plugin capability functions as the LAST
  * argument. This is the only surface through which a plugin talks to the
  * host. Do not add APIs here without a clear future need.
@@ -96,6 +132,12 @@ export interface PluginContext {
   readonly manifest: PluginManifest;
   /** Route a log line through the host logger. */
   log(...args: unknown[]): void;
+  /**
+   * Engine-controlled HTTP capability (Phase 4). Every request is
+   * validated and bounded by the engine (scheme, timeout, size,
+   * redirects, headers) — see src/http.ts for the limits.
+   */
+  readonly http: PluginHttp;
 }
 
 /** Structured runtime error types returned by the PluginRuntime. */
@@ -151,4 +193,13 @@ export interface PluginRuntimeOptions {
   memoryLimitBytes?: number;
   /** Receives plugin log lines (default: console with a plugin prefix). */
   logger?: (pluginId: string, message: string) => void;
+  /**
+   * Engine-level limits for the controlled HTTP capability. Values here
+   * are ENGINE maximums: plugin-supplied request options are clamped to
+   * them and can never raise them. See DEFAULT_HTTP_LIMITS in
+   * src/http.ts for the built-in defaults.
+   */
+  http?: {
+    limits?: Partial<HttpLimits>;
+  };
 }

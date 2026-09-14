@@ -97,13 +97,27 @@ test("host globals are unavailable inside the sandbox", async (t) => {
   }
 });
 
-test("the plugin context surface is exactly manifest + log", async (t) => {
+test("the plugin context surface is exactly http + log + manifest (Phase 4)", async (t) => {
+  // Phase 4 adds context.http to the Phase 3 surface (manifest + log).
+  // The surface must stay exactly this controlled set — no host objects.
   const base = await makeTempDir(t);
   const plugin = await writePlugin(
     base,
     "surface",
     `export const plugin = {
-      surface: (context) => Object.keys(context).sort(),
+      surface: (context) =>
+        Object.keys(context)
+          .sort()
+          .map((k) => {
+            let kind = typeof context[k];
+            if (k === "http") {
+              kind =
+                typeof context.http === "object" && context.http !== null
+                  ? "http(" + Object.keys(context.http).sort().join(",") + ")"
+                  : kind;
+            }
+            return k + ":" + kind;
+          }),
     };`,
   );
   const runtime = new PluginRuntime();
@@ -115,7 +129,11 @@ test("the plugin context surface is exactly manifest + log", async (t) => {
   const result = await runtime.execute(load.plugin, "surface");
   assert.ok(result.success);
   if (result.success) {
-    assert.deepEqual(result.value, ["log", "manifest"]);
+    assert.deepEqual(result.value, [
+      "http:http(get,getJson,request)",
+      "log:function",
+      "manifest:object",
+    ]);
   }
 });
 
