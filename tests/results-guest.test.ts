@@ -18,6 +18,14 @@ import { after, before, test, type TestContext } from "node:test";
 import { normalizeSourceResults, type SourceResult } from "../src/index.js";
 import { PluginRuntime } from "../src/runtime.js";
 import type { Plugin } from "../src/types.js";
+/**
+ * Pipeline fixtures are served from a LOCAL server on 127.0.0.1. The
+ * engine's DEFAULT network policy blocks loopback/private/link-local
+ * targets (SSRF defence — see src/network.ts), so the test host opts in
+ * explicitly. A plugin can never grant itself this permission.
+ */
+const ALLOW_LOCAL = { allowPrivateNetwork: true } as const;
+
 
 // ---------------------------------------------------------------------------
 // Local test server
@@ -119,7 +127,7 @@ async function runRaw(
 ): Promise<unknown> {
   const base = await temp(t);
   const p = await plugin(base, name, source);
-  const runtime = new PluginRuntime();
+  const runtime = new PluginRuntime({ http: { network: ALLOW_LOCAL } });
   t.after(() => runtime.shutdown());
   const loaded = await runtime.loadPlugin(p);
   assert.equal(loaded.ok, true, "plugin must load");

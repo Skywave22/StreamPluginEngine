@@ -13,6 +13,15 @@
 
 export const ENGINE_NAME = "stream-plugin-engine";
 export const ENGINE_VERSION = "0.1.0";
+/**
+ * The engine's PRODUCTION RUNTIME capability level: Phase 6 (normalized
+ * source result pipeline) is the last phase that adds runtime behaviour.
+ *
+ * Phase 7 exists but is deliberately NOT reflected here: it is
+ * developer-only validation tooling (security regression, CLI end-to-end,
+ * lifecycle/concurrency tests, and `tools/benchmark.mjs`). It adds no
+ * runtime capability and is not part of this public API.
+ */
 export const ENGINE_PHASE = 6 as const;
 
 export { validateManifest } from "./manifest.js";
@@ -36,6 +45,21 @@ export type {
   HttpRequestOptions,
   HttpResponse,
 } from "./http.js";
+
+export {
+  DEFAULT_NETWORK_POLICY,
+  checkRequestTarget,
+  classifyAddress,
+  hostFromUrl,
+  isAddressAllowed,
+} from "./network.js";
+
+export type {
+  AddressClass,
+  AddressResolver,
+  NetworkDecision,
+  NetworkPolicy,
+} from "./network.js";
 
 export {
   PHASE5_LIMITS,

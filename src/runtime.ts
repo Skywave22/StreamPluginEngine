@@ -100,6 +100,18 @@ class PluginTimeoutError extends Error {
   }
 }
 
+/**
+ * Thrown internally when an operation's abort scope fires while it is
+ * awaiting the guest — i.e. the plugin was disposed mid-operation. Without
+ * this the awaiting caller would hang until the full execution deadline.
+ */
+class PluginAbortedError extends Error {
+  constructor() {
+    super("Plugin operation was aborted");
+    this.name = "PluginAbortedError";
+  }
+}
+
 /** Thrown internally to carry a specific runtime error type + message. */
 class RuntimeFailure extends Error {
   constructor(
@@ -109,6 +121,19 @@ class RuntimeFailure extends Error {
     super(message);
     this.name = "RuntimeFailure";
   }
+}
+
+/**
+ * One capability call currently in flight on a plugin.
+ *
+ * `dispose()` needs this: guest handles owned by an unfinished operation
+ * must be released BEFORE the context and runtime are freed.
+ */
+interface ActiveOperation {
+  /** Handles created for this operation, disposed in reverse order. */
+  tracked: Disposable[];
+  /** Aborts the operation's host-side HTTP requests. */
+  abort: AbortController;
 }
 
 /**
@@ -129,6 +154,38 @@ class LoadedPluginHandle implements LoadedPlugin {
    * running.
    */
   readonly inFlightHttp = new Set<AbortController>();
+  /**
+   * Tail of this plugin's operation queue.
+   *
+   * Guest operations on ONE plugin sandbox are serialized, and this is a
+   * correctness requirement, not a throughput choice:
+   *
+   * - A QuickJS runtime is single-threaded and has exactly ONE interrupt
+   *   handler slot. `execute()` installs a deadline handler on entry and
+   *   removes it in `finally`. If two operations overlapped, the first to
+   *   finish would remove the handler the other still depended on, and
+   *   that operation would then run with NO timeout at all.
+   * - Worse, guest code executes synchronously on the host thread, so an
+   *   unbounded spin cannot be preempted by anything except that handler.
+   *   A plugin that spun after an `await` would block the host event loop
+   *   permanently — taking the whole application down, not just itself.
+   * - The guest job queue is also shared, so overlapping operations would
+   *   run each other's continuations under the wrong deadline.
+   *
+   * Serializing removes all three races. Different plugins have different
+   * runtimes and still execute concurrently.
+   */
+  queue: Promise<unknown> = Promise.resolve();
+  /**
+   * Operations currently in flight on this plugin.
+   *
+   * Disposal must release their guest handles first. `JS_FreeRuntime`
+   * asserts that the runtime's GC object list is empty and calls
+   * `abort()` if it is not — which tears down the QuickJS Wasm instance
+   * from under the host process. Disposing a plugin while one of its
+   * capabilities was awaiting an HTTP response used to hit exactly that.
+   */
+  readonly activeOperations = new Set<ActiveOperation>();
   /** Set when the guest environment has been (or is being) disposed. */
   disposed = false;
 
@@ -153,6 +210,28 @@ class LoadedPluginHandle implements LoadedPlugin {
       controller.abort(new Error("plugin disposed"));
     }
     this.inFlightHttp.clear();
+
+    // Release guest handles owned by in-flight operations BEFORE the
+    // context/runtime are freed. QuickJS aborts the whole Wasm instance
+    // if any guest object is still alive at JS_FreeRuntime time, so this
+    // ordering is what makes "dispose a plugin mid-request" safe.
+    for (const operation of this.activeOperations) {
+      operation.abort.abort(new Error("plugin disposed"));
+      // Reverse order: later handles may reference earlier ones.
+      for (let i = operation.tracked.length - 1; i >= 0; i--) {
+        const item = operation.tracked[i];
+        if (item && item.alive) {
+          try {
+            item.dispose();
+          } catch {
+            // The guest is already gone; nothing left to release.
+          }
+        }
+      }
+      operation.tracked.length = 0;
+    }
+    this.activeOperations.clear();
+
     for (const fn of this.capabilityFns.values()) {
       fn.dispose();
     }
@@ -177,7 +256,11 @@ export class PluginRuntime {
     this.logger =
       options.logger ??
       ((pluginId, message) => console.log(`[plugin:${pluginId}] ${message}`));
-    this.httpClient = new HttpClient({ limits: options.http?.limits });
+    this.httpClient = new HttpClient({
+      limits: options.http?.limits,
+      network: options.http?.network,
+      resolver: options.http?.resolver,
+    });
   }
 
   /**
@@ -395,6 +478,48 @@ export class PluginRuntime {
       });
     }
 
+    // Serialize guest work on this plugin's sandbox — see the
+    // LoadedPluginHandle.queue doc comment for why this is a correctness
+    // requirement. `executionTimeMs` is measured from BEFORE queueing, so
+    // it reports the latency the caller actually experienced.
+    const previous = handle.queue;
+    const current = previous.then(
+      () => this.runOperation(handle, fn, args, executionTimeMs),
+      () => this.runOperation(handle, fn, args, executionTimeMs),
+    );
+    // The queue tail must never reject, otherwise every later operation
+    // would inherit a rejected predecessor.
+    handle.queue = current.then(
+      () => undefined,
+      () => undefined,
+    );
+    return current;
+  }
+
+  /**
+   * Execute one capability call on a plugin whose sandbox is not
+   * otherwise busy. Owns the interrupt handler and the operation's HTTP
+   * abort scope for the duration of the call.
+   */
+  private async runOperation(
+    handle: LoadedPluginHandle,
+    fn: QuickJSHandle,
+    args: readonly unknown[],
+    executionTimeMs: () => number,
+  ): Promise<PluginExecutionResult> {
+    const fail = (error: PluginRuntimeError): PluginExecutionResult => ({
+      success: false,
+      error,
+      executionTimeMs: executionTimeMs(),
+    });
+
+    if (handle.disposed) {
+      return fail({
+        type: "PLUGIN_RUNTIME_ERROR",
+        message: `Plugin '${handle.pluginId}' was disposed before this operation ran`,
+      });
+    }
+
     const context = handle.context;
     const runtime = handle.runtime;
     const tracked: Disposable[] = [];
@@ -408,6 +533,10 @@ export class PluginRuntime {
     // ends (success, error, or deadline) so nothing runs uncontrolled.
     const opAbort = new AbortController();
     handle.inFlightHttp.add(opAbort);
+    // Registering the operation lets dispose() release these handles
+    // before freeing the context/runtime (see LoadedPluginHandle.dispose).
+    const operation: ActiveOperation = { tracked, abort: opAbort };
+    handle.activeOperations.add(operation);
     try {
       const callArgs: QuickJSHandle[] = [];
       for (const arg of args) {
@@ -434,9 +563,19 @@ export class PluginRuntime {
         valueHandle,
         tracked,
         deadline,
+        opAbort.signal,
       );
       if (settled !== valueHandle) {
         track(settled, tracked);
+      }
+      // The plugin may have been disposed while this operation was
+      // awaiting: dispose() already released `tracked`, so touching the
+      // guest now would be a use-after-free. Report it structurally.
+      if (handle.disposed || !context.alive) {
+        return fail({
+          type: "PLUGIN_RUNTIME_ERROR",
+          message: `Plugin '${handle.pluginId}' was disposed during this operation`,
+        });
       }
       return {
         success: true,
@@ -444,18 +583,37 @@ export class PluginRuntime {
         executionTimeMs: executionTimeMs(),
       };
     } catch (error) {
+      // The guest environment went away underneath this operation. That is
+      // a normal outcome of a concurrent dispose(), not a host failure.
+      if (handle.disposed || !runtime.alive) {
+        return fail({
+          type: "PLUGIN_RUNTIME_ERROR",
+          message: `Plugin '${handle.pluginId}' was disposed during this operation`,
+        });
+      }
       // Errors classified inside are already structured {type, message}.
       if (isRuntimeErrorShape(error)) {
         return fail(error);
       }
       return fail(this.toRuntimeError(error, "PLUGIN_RUNTIME_ERROR"));
     } finally {
-      runtime.removeInterruptHandler();
+      handle.activeOperations.delete(operation);
+      if (runtime.alive) {
+        runtime.removeInterruptHandler();
+      }
       // Abort any HTTP request still in flight for this operation.
       opAbort.abort(new Error("operation ended"));
       handle.inFlightHttp.delete(opAbort);
+      // dispose() may already have released these (it clears the array),
+      // and `alive` guards against a double free.
       for (const d of tracked) {
-        if (d.alive) d.dispose();
+        if (d.alive) {
+          try {
+            d.dispose();
+          } catch {
+            // Guest already torn down by a concurrent dispose().
+          }
+        }
       }
     }
   }
@@ -501,6 +659,7 @@ export class PluginRuntime {
     valueHandle: QuickJSHandle,
     tracked: Disposable[],
     deadline: number,
+    signal?: AbortSignal,
   ): Promise<QuickJSHandle> {
     const state = context.getPromiseState(valueHandle);
     if (state.type !== "pending") {
@@ -518,11 +677,21 @@ export class PluginRuntime {
     this.pumpJobs(runtime, tracked, deadline);
     let settled;
     try {
-      settled = await this.withDeadline(hostPromise, deadline);
+      settled = await this.withDeadline(hostPromise, deadline, signal);
     } catch (error) {
       throw this.classify(error, "PLUGIN_TIMEOUT");
     }
     this.pumpJobs(runtime, tracked, deadline);
+
+    // The await above is the point where a concurrent dispose() can land.
+    // Check BEFORE touching the guest: unwrapping on a freed context
+    // aborts the Wasm instance rather than throwing a catchable error.
+    if (!context.alive || !runtime.alive) {
+      throw new RuntimeFailure(
+        "PLUGIN_RUNTIME_ERROR",
+        "Plugin environment was disposed during this operation",
+      );
+    }
 
     let result: QuickJSHandle;
     try {
@@ -540,7 +709,10 @@ export class PluginRuntime {
     tracked: Disposable[],
     deadline: number,
   ): void {
-    while (runtime.hasPendingJob() && performance.now() < deadline) {
+    // `runtime.alive` guard: a concurrent dispose() may have freed the
+    // runtime while this operation was awaiting, and touching a freed
+    // QuickJS runtime aborts the Wasm instance.
+    while (runtime.alive && runtime.hasPendingJob() && performance.now() < deadline) {
       const jobs = track(runtime.executePendingJobs(), tracked);
       if (jobs.error !== undefined) {
         // Surface the job's exception (throws a native error).
@@ -559,17 +731,42 @@ export class PluginRuntime {
    * cleared as soon as the race settles so completed operations never
    * delay process shutdown.
    */
-  private withDeadline<T>(promise: Promise<T>, deadline: number): Promise<T> {
+  private withDeadline<T>(
+    promise: Promise<T>,
+    deadline: number,
+    signal?: AbortSignal,
+  ): Promise<T> {
     const remaining = Math.max(0, deadline - performance.now());
     return new Promise<T>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new PluginTimeoutError()), remaining);
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new PluginTimeoutError());
+      }, remaining);
+      // An abort (plugin disposed / operation torn down) must settle the
+      // race IMMEDIATELY; otherwise the guest promise can never settle
+      // again and the caller would wait out the whole deadline.
+      const onAbort = () => {
+        cleanup();
+        reject(new PluginAbortedError());
+      };
+      const cleanup = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+      };
+      if (signal) {
+        if (signal.aborted) {
+          onAbort();
+          return;
+        }
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
       promise.then(
         (value) => {
-          clearTimeout(timer);
+          cleanup();
           resolve(value);
         },
         (error) => {
-          clearTimeout(timer);
+          cleanup();
           reject(error);
         },
       );
@@ -1173,6 +1370,12 @@ export class PluginRuntime {
       return {
         type: "PLUGIN_TIMEOUT",
         message: "Plugin did not complete within the time limit",
+      };
+    }
+    if (error instanceof PluginAbortedError) {
+      return {
+        type: "PLUGIN_RUNTIME_ERROR",
+        message: "Plugin operation was aborted (the plugin was disposed or the operation was cancelled)",
       };
     }
     if (error instanceof RuntimeFailure) {

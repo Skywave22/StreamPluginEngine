@@ -23,6 +23,15 @@ import { after, before, test, type TestContext } from "node:test";
 import { HttpClient, HttpError } from "../src/http.js";
 import { PluginManager } from "../src/manager.js";
 import { PluginRuntime } from "../src/runtime.js";
+
+/**
+ * These fixtures are served from a LOCAL server on 127.0.0.1. The engine's
+ * DEFAULT network policy blocks loopback/private/link-local targets (SSRF
+ * defence — see src/network.ts and tests/network-policy.test.ts), so the
+ * test host opts in explicitly. This mirrors what a host application does
+ * for local development; a plugin can never grant itself this permission.
+ */
+const ALLOW_LOCAL = { allowPrivateNetwork: true } as const;
 import type { LoadedPlugin, PluginLoadResult } from "../src/types.js";
 
 // ---------------------------------------------------------------------------
@@ -79,6 +88,24 @@ async function startTestServer(): Promise<void> {
       }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify(received));
+    } else if (p === "/proto-headers") {
+      // Hostile response headers: names that collide with
+      // Object.prototype members. Built via JSON.parse so `__proto__` is a
+      // real OWN key rather than a prototype assignment in the literal.
+      const hostile = JSON.parse(
+        '{"__proto__":"PWNED","constructor":"CTOR-VALUE","tostring":"TS-VALUE","x-dup":"a"}',
+      ) as Record<string, string>;
+      for (const [name, value] of Object.entries(hostile)) {
+        try {
+          res.setHeader(name, value);
+        } catch {
+          // Node rejects some names; the test asserts on what arrives.
+        }
+      }
+      // A genuine duplicate multi-value header, to prove joining still works.
+      res.setHeader("x-dup", ["a", "b"]);
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end("proto");
     } else if (p === "/status/404") {
       res.writeHead(404, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: "not found" }));
@@ -280,7 +307,7 @@ async function withHttpPlugin(
   await manager.discoverPlugins(base);
   const discovered = manager.getPlugin(manifest.id);
   assert.ok(discovered, "plugin must be discovered");
-  const runtime = new PluginRuntime();
+  const runtime = new PluginRuntime({ http: { network: ALLOW_LOCAL } });
   t.after(() => runtime.shutdown());
   const load = await runtime.loadPlugin(discovered);
   return { runtime, load, loaded: load.ok ? load.plugin : null };
@@ -646,7 +673,7 @@ test("plugins without HTTP usage still work (Phase 3 compatibility)", async (t) 
 // ---------------------------------------------------------------------------
 
 test("plugin-supplied limits are clamped to engine maximums", async () => {
-  const client = new HttpClient();
+  const client = new HttpClient({ network: ALLOW_LOCAL });
   // A huge requested timeout must not throw; it is clamped (the request
   // itself is fast, so it simply succeeds).
   const res = await client.request(`${baseUrl}/get`, { timeoutMs: 999_999_999 });
@@ -655,7 +682,7 @@ test("plugin-supplied limits are clamped to engine maximums", async () => {
 });
 
 test("invalid option values are rejected with HTTP_INVALID_REQUEST", async () => {
-  const client = new HttpClient();
+  const client = new HttpClient({ network: ALLOW_LOCAL });
   const expectError = async (options: Parameters<HttpClient["request"]>[1]) => {
     await assert.rejects(
       () => client.request(`${baseUrl}/get`, options),
@@ -673,11 +700,93 @@ test("invalid option values are rejected with HTTP_INVALID_REQUEST", async () =>
 });
 
 test("supported methods are GET and POST only", async () => {
-  const client = new HttpClient();
+  const client = new HttpClient({ network: ALLOW_LOCAL });
   const res = await client.request(`${baseUrl}/get`, { method: "GET" });
   assert.equal(res.status, 200);
   await assert.rejects(
     () => client.request(`${baseUrl}/post`, { method: "PUT" as never }),
     (error: unknown) => error instanceof HttpError && error.code === "HTTP_INVALID_REQUEST",
   );
+});
+
+// ---------------------------------------------------------------------------
+// Phase 7 regression: response/request header prototype-chain handling
+// ---------------------------------------------------------------------------
+//
+// BUG (found in the Phase 1-6 audit): collectHeaders() detected duplicate
+// response headers with `key in result`, which also matches INHERITED
+// Object.prototype members. A server-controlled header named `constructor`
+// therefore produced "function Object() { [native code] }, <value>" —
+// corrupting the header AND leaking host function source text into
+// guest-visible data. Request headers named `__proto__` were also silently
+// dropped instead of rejected.
+
+test("response headers named after Object.prototype members are not corrupted", async () => {
+  const client = new HttpClient({ network: ALLOW_LOCAL });
+  const res = await client.request(`${baseUrl}/proto-headers`);
+  assert.equal(res.status, 200);
+  assert.equal(res.body, "proto");
+
+  // The value must be exactly what the server sent — no host internals
+  // prepended by a bogus "duplicate" join.
+  assert.equal(res.headers["constructor"], "CTOR-VALUE");
+  assert.equal(res.headers["tostring"], "TS-VALUE");
+  for (const value of Object.values(res.headers)) {
+    assert.ok(
+      !value.includes("native code"),
+      `host internals leaked into a response header: ${value}`,
+    );
+    assert.ok(
+      !value.includes("function Object"),
+      `host internals leaked into a response header: ${value}`,
+    );
+  }
+});
+
+test("genuine duplicate response headers are still joined with ', '", async () => {
+  const client = new HttpClient({ network: ALLOW_LOCAL });
+  const res = await client.request(`${baseUrl}/proto-headers`);
+  assert.equal(res.headers["x-dup"], "a, b");
+});
+
+test("response header maps never carry a hijacked prototype", async () => {
+  const client = new HttpClient({ network: ALLOW_LOCAL });
+  const res = await client.request(`${baseUrl}/proto-headers`);
+  assert.equal(
+    Object.getPrototypeOf(res.headers),
+    Object.prototype,
+    "the header map's prototype must be untouched",
+  );
+  // A `__proto__` response header must never become an own property or a
+  // prototype write; either it is absent or it is plain data.
+  const globalProbe = {} as Record<string, unknown>;
+  assert.equal(globalProbe["PWNED"], undefined, "Object.prototype must not be polluted");
+  // The map must stay JSON-serializable for the guest boundary.
+  const roundTrip = JSON.parse(JSON.stringify(res.headers)) as Record<string, string>;
+  assert.deepEqual(Object.keys(roundTrip).sort(), Object.keys(res.headers).sort());
+});
+
+test("a request header named '__proto__' is rejected, not silently dropped", async () => {
+  const client = new HttpClient({ network: ALLOW_LOCAL });
+  const hostile = JSON.parse('{"__proto__":"evil","x-real":"v"}') as Record<string, string>;
+  await assert.rejects(
+    () => client.request(`${baseUrl}/get`, { headers: hostile }),
+    (error: unknown) =>
+      error instanceof HttpError &&
+      error.code === "HTTP_INVALID_REQUEST" &&
+      error.message.includes("__proto__"),
+  );
+  const probe = {} as Record<string, unknown>;
+  assert.equal(probe["evil"], undefined, "Object.prototype must not be polluted");
+});
+
+test("ordinary request headers still work after the prototype guard", async () => {
+  const client = new HttpClient({ network: ALLOW_LOCAL });
+  const res = await client.request(`${baseUrl}/echo-headers`, {
+    headers: { "x-custom": "value", "constructor": "harmless" },
+  });
+  assert.equal(res.status, 200);
+  const echoed = JSON.parse(res.body) as Record<string, string>;
+  assert.equal(echoed["x-custom"], "value");
+  assert.equal(echoed["constructor"], "harmless");
 });

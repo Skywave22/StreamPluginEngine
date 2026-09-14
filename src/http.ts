@@ -13,6 +13,10 @@
  * Security properties:
  * - Only http: and https: URLs are allowed (file:, data:, javascript:,
  *   node:, ... are rejected before any I/O).
+ * - Request TARGETS are checked against the engine network policy
+ *   (src/network.ts) before every hop: by default loopback, private,
+ *   link-local (including cloud metadata), and other reserved ranges are
+ *   unreachable. Hosts opt in with `allowPrivateNetwork: true`.
  * - Every request has a bounded timeout (plugin value clamped to the
  *   engine maximum).
  * - Response size is bounded and enforced while streaming; oversized
@@ -23,6 +27,12 @@
  * - The engine sets a default User-Agent; it never injects host
  *   credentials or environment data.
  */
+import {
+  DEFAULT_NETWORK_POLICY,
+  checkRequestTarget,
+  systemResolver,
+} from "./network.js";
+import type { AddressResolver, NetworkPolicy } from "./network.js";
 
 export type HttpMethod = "GET" | "POST";
 
@@ -62,6 +72,7 @@ export interface HttpResponse {
 export const HTTP_ERROR_CODES = [
   "HTTP_INVALID_URL",
   "HTTP_UNSUPPORTED_SCHEME",
+  "HTTP_FORBIDDEN_TARGET",
   "HTTP_TIMEOUT",
   "HTTP_ABORTED",
   "HTTP_NETWORK_ERROR",
@@ -137,6 +148,19 @@ export const DEFAULT_HTTP_LIMITS: HttpLimits = {
 export interface HttpClientOptions {
   /** Override individual engine limits (all optional). */
   limits?: Partial<HttpLimits>;
+  /**
+   * Engine network policy: which addresses plugins may reach. Defaults
+   * to `DEFAULT_NETWORK_POLICY` (public internet only). Set
+   * `allowPrivateNetwork: true` to permit loopback/private/link-local
+   * targets — intended for local development and deterministic tests
+   * that serve fixtures from a local server.
+   */
+  network?: Partial<NetworkPolicy>;
+  /**
+   * DNS resolver used to check hostnames against the network policy.
+   * Injectable so tests stay offline and deterministic.
+   */
+  resolver?: AddressResolver;
 }
 
 interface EffectiveRequest {
@@ -168,9 +192,15 @@ const HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 export class HttpClient {
   /** The effective engine limits (documented defaults + overrides). */
   readonly limits: HttpLimits;
+  /** The effective engine network policy (which targets are reachable). */
+  readonly network: NetworkPolicy;
+  /** DNS resolver used for hostname policy checks (injectable). */
+  private readonly resolver: AddressResolver;
 
   constructor(options: HttpClientOptions = {}) {
     this.limits = { ...DEFAULT_HTTP_LIMITS, ...options.limits };
+    this.network = { ...DEFAULT_NETWORK_POLICY, ...options.network };
+    this.resolver = options.resolver ?? systemResolver;
   }
 
   /**
@@ -227,6 +257,19 @@ export class HttpClient {
             "HTTP_TIMEOUT",
             `HTTP request timed out after ${effective.timeoutMs} ms`,
           );
+        }
+
+        // Network policy gate: applied to the initial URL AND to every
+        // redirect hop, so a redirect can never smuggle a request into a
+        // blocked range. Rejection is structured (HTTP_FORBIDDEN_TARGET),
+        // never a host stack trace.
+        const decision = await checkRequestTarget(
+          currentUrl,
+          this.network,
+          this.resolver,
+        );
+        if (!decision.allowed) {
+          throw new HttpError(decision.code, decision.message);
         }
 
         let response: Response;
@@ -414,6 +457,15 @@ function validateHeaders(
         `Invalid header name '${truncate(name)}'`,
       );
     }
+    // Reject rather than silently drop: `result["__proto__"] = value` on a
+    // plain object goes through the prototype setter and would not create
+    // the intended own property.
+    if (name === "__proto__") {
+      throw new HttpError(
+        "HTTP_INVALID_REQUEST",
+        "Header name '__proto__' is not allowed",
+      );
+    }
     if (typeof value !== "string") {
       throw new HttpError("HTTP_INVALID_REQUEST", `Header '${name}' must have a string value`);
     }
@@ -548,7 +600,23 @@ async function readBoundedResponse(
 function collectHeaders(headers: Headers): Record<string, string> {
   const result: Record<string, string> = {};
   headers.forEach((value, key) => {
-    result[key] = key in result ? `${result[key]}, ${value}` : value;
+    // `__proto__` must never be assigned: on a plain object the
+    // assignment goes through the prototype setter instead of creating
+    // an own property, so it would either be silently dropped or (with an
+    // object value) alter `result`'s prototype. Response header names are
+    // server-controlled, so treat this one as hostile.
+    if (key === "__proto__") {
+      return;
+    }
+    // Duplicate detection MUST use own properties. `key in result` also
+    // matches inherited Object.prototype members ("constructor",
+    // "toString", "valueOf", ...), which would both corrupt the value and
+    // leak host function source text into guest-visible data — e.g. a
+    // server-sent `constructor: X` header used to produce
+    // "function Object() { [native code] }, X".
+    result[key] = Object.hasOwn(result, key)
+      ? `${result[key]}, ${value}`
+      : value;
   });
   return result;
 }

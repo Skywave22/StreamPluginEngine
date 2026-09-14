@@ -12,6 +12,7 @@ import type {
   HttpRequestOptions,
   HttpResponse,
 } from "./http.js";
+import type { AddressResolver, NetworkPolicy } from "./network.js";
 import type { PluginHtml, PluginJson } from "./phase5-types.js";
 
 /**
@@ -215,5 +216,23 @@ export interface PluginRuntimeOptions {
    */
   http?: {
     limits?: Partial<HttpLimits>;
+    /**
+     * Engine network policy for the controlled HTTP capability: which
+     * addresses a plugin may reach. Defaults to
+     * `DEFAULT_NETWORK_POLICY` — public internet only, so loopback,
+     * RFC 1918, link-local (including cloud metadata endpoints), and
+     * other reserved ranges are rejected with `HTTP_FORBIDDEN_TARGET`.
+     *
+     * Set `{ allowPrivateNetwork: true }` to permit those targets. That
+     * is a HOST decision (local development, or the deterministic test
+     * suite serving fixtures from a local server); a plugin can never
+     * influence it.
+     */
+    network?: Partial<NetworkPolicy>;
+    /**
+     * DNS resolver used for hostname policy checks. Injectable so tests
+     * stay offline and deterministic.
+     */
+    resolver?: AddressResolver;
   };
 }
