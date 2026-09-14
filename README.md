@@ -1,37 +1,51 @@
 # StreamPluginEngine
 
-Lightweight, cross-platform plugin engine for a future
-media/streaming application. This repository contains the **engine only** —
-no UI, no browser, no scraping targets.
+Lightweight, cross-platform plugin engine for a future media/streaming application. This repository contains the **engine only** — no UI, browser automation, or media-player application.
 
-## Current status: Phase 4 — controlled HTTP capability
+## Current status: Phase 5 — HTML + JSON parsing capabilities
 
-Implemented and tested:
+Phases 1–4 remain implemented:
 
-- Typed plugin manifest format, validation, discovery, loading (Phases 1–2)
-- In-memory plugin registry with duplicate-ID protection (Phase 2)
-- **`PluginRuntime`** — executes plugin JavaScript inside QuickJS, a
-  separate JavaScript engine compiled to WebAssembly
-  (`quickjs-emscripten`). Plugins get a controlled context
-  (`manifest` + `log` + `http`), JSON arguments, and JSON results.
-- **Engine-controlled HTTP** — plugins make real HTTP/HTTPS requests through
-  `context.http` (`get`, `getJson`, `request`), but the network call is
-  performed by the **host**, never by the sandbox. Plugins keep **no**
-  direct Node networking, sockets, streams, or `fetch` — only this small,
-  bounded capability (see [The sandbox](#the-sandbox) and
-  [HTTP capability](#http-capability-phase-4)).
-- Capability detection (`search`, `getDetails`, … or any function export)
-- Structured results, timeouts (interrupt hooks), memory limits, and error
-  isolation — a broken plugin never crashes the engine
-- CLI: `plugins:list` and `plugin:run`
-- Example plugin that genuinely executes in the runtime, including a live
-  `httpExample` capability that performs a real GET and handles failures
+- Typed plugin manifest format, validation, discovery, and loading (Phases 1–2)
+- In-memory plugin registry with duplicate-ID protection
+- `PluginRuntime` executing plugin JavaScript inside isolated QuickJS/Wasm
+- Runtime memory and CPU/deadline limits and error isolation
+- Controlled engine-side HTTP through `context.http` (Phase 4)
+- CLI plugin discovery and execution
+- Offline tests for foundation, runtime, security, and HTTP behavior
 
-**Not implemented yet:** HTML parsing, scraping, media/stream extraction,
-enable/disable, parallel execution, benchmarking.
-**HTML parsing, scraping, and media extraction are intentionally not
-implemented in Phase 4** — see the [HTTP capability](#http-capability-phase-4)
-section for what that boundary means.
+### Phase 5
+
+Phase 5 adds parser-only data capabilities on top of the existing HTTP layer:
+
+- `context.json.parse(text)`
+- `context.json.stringify(value)`
+- `context.html.parse(html)`
+- `context.html.select(document, selector)`
+- `context.html.extract(element)`
+- CSS selectors: tag, `.class`, `#id`, `tag.class`, descendant selectors, and basic attribute selectors
+- Element information including tag name, normalized text, attributes, `href`, `src`, `class`, `id`, `data-*`, `innerHTML`, and `outerHTML`
+- Bounded HTML size, JSON size, and parsed-node count
+- Malformed HTML tolerance
+- Parser-only behavior: HTML parsing never executes JavaScript and never fetches `href`/`src`
+
+A typical Phase 5 plugin flow is:
+
+```js
+const response = await context.http.get(url);
+const document = context.html.parse(response.body);
+const cards = context.html.select(document, ".card");
+
+return cards.map((card) => context.html.extract(card));
+```
+
+JSON can be handled directly:
+
+```js
+const response = await context.http.get(url);
+const data = context.json.parse(response.body);
+return data;
+```
 
 ## Quick start
 
@@ -39,220 +53,182 @@ Requires Node.js >= 20.
 
 ```bash
 npm install
-npm run build         # compile TypeScript with tsc
-npm test              # build, then run tests with the built-in node:test runner
-npm run plugins:list  # list plugins discovered in plugins/
-npm run plugin:run -- example.source test                  # run the self-test
-npm run plugin:run -- example.source search '"Example"'    # run with one JSON argument
-npm run plugin:run -- example.source search '["Example"]'  # or a JSON array of arguments
+npm run build
+npm test
+npm run plugins:list
+npm run plugin:run -- example.source test
 ```
 
-Example `plugin:run` output:
-
-```
-Plugin: Example Source
-Operation: test
-Status: SUCCESS
-Result: "Example Result"
-Execution time: 0.41 ms
-```
+`npm test` builds the TypeScript project first and then runs the built-in Node.js test runner.
 
 ## Project layout
 
-```
-src/        Engine source (manifest, validator, loader, manager, runtime, CLI)
-tests/      Tests, run with the built-in Node.js test runner
-plugins/    Example plugin (executes in the runtime)
+```text
+src/        Engine source
+tests/      Tests
+plugins/    Example plugin
 dist/       Build output (generated, not committed)
 ```
 
 ## Writing a plugin
 
-A plugin is a directory inside `plugins/` with `manifest.json` (see
-Phase 2 rules) and an ES-module entry file. Contract:
+A plugin is a directory inside `plugins/` with `manifest.json` and an ES-module entry file.
 
 ```js
 export const plugin = {
-  // Each function property is a capability. Arguments come first,
-  // then the controlled context object LAST.
   search: async (query, context) => {
     context.log("search", query);
-    return [{ id: "example-1", title: "Example Result" }]; // JSON only
+    return [{ id: "example-1", title: "Example Result" }];
   },
-  // Make a request through the engine-controlled HTTP capability.
-  fetchInfo: async (url, context) => {
+
+  fetchAndParse: async (url, context) => {
     const res = await context.http.get(url);
-    if (res.status !== 200) {
-      throw new Error("expected 200, got " + res.status);
-    }
-    return res.body; // string; use res.headers for metadata
+    const document = context.html.parse(res.body);
+    const items = context.html.select(document, ".item");
+
+    return items.map((item) => context.html.extract(item));
+  },
+
+  fetchJson: async (url, context) => {
+    const res = await context.http.get(url);
+    return context.json.parse(res.body);
   },
 };
 ```
 
-- The module must export an object named `plugin`; at least one function
-  capability is required. Non-function properties are ignored.
-- `context.manifest` is this plugin's manifest; `context.log(...)` routes
-  to the host logger; `context.http` performs engine-controlled HTTP.
-  That is the entire host surface in Phase 4.
-- Capability arguments must be JSON-serializable; results are returned to
-  the host as JSON (everything else is dropped).
-- `import` works for files **inside the plugin directory only**. Host
-  modules (`node:fs`, `node:http`, `node:net`, `node:tls`), built-ins,
-  absolute paths, and `..` escapes are rejected.
+Capability arguments come first and the controlled context is last.
 
 ## The sandbox
 
-Plugins run inside **QuickJS** (a mature, actively maintained embedded JS
-engine) compiled to WebAssembly. It is a separate engine from the host
-Node.js process — the plugin realm contains no host objects by
-construction, which is what makes the isolation real (unlike `node:vm`,
-which is documented as not a security boundary and is deliberately not
-used).
+Plugins run inside QuickJS compiled to WebAssembly. The plugin realm is separate from the host Node.js JavaScript realm.
 
-What a plugin has:
+Plugins do not get direct access to:
 
-- Standard JS builtins (Object, Array, Promise, JSON, Math, Date, RegExp,
-  Map/Set, TypedArrays)
-- Its own heap, isolated from every other plugin (one QuickJS runtime per
-  plugin)
-- The controlled context (`manifest`, `log`, `http`) and JSON arguments
-- Relative imports within its own directory
+- `process`, `require`, `module`, `__dirname`, `Buffer`, or host `fetch`
+- Node filesystem/network modules
+- Environment variables or shell access
+- Other plugins' globals
+- Host files or arbitrary sockets
 
-What a plugin does NOT have:
+The sanctioned network surface is `context.http`. HTML parsing and JSON parsing do not add direct network or filesystem access.
 
-- `process`, `require`, `module`, `__dirname`, `Buffer`, `fetch`
-- `fs`, `net`, `tls`, `child_process`, or any other Node built-in
-- Environment variables, shell access, host objects, other plugins' globals
-- Any API beyond the context — the Phase 4 context is intentionally small
-
-The one sanctioned exception is **network access, but only through
-`context.http`**. The sandbox itself has no network at all — the host
-performs every request on the plugin's behalf. See the next section.
-
-Execution limits (per operation / per plugin):
-
-- Time limit via QuickJS interrupt hooks (default 5 s) — runaway loops are
-  interrupted and reported as `PLUGIN_TIMEOUT`
-- Guest heap limit (default 64 MiB) — over-allocation is reported as
-  `PLUGIN_MEMORY_LIMIT`
-- Promises that never settle are bounded by the same time limit
-
-### Sandbox limitations (read this)
-
-- This is **engine-level isolation inside a single process**, not an
-  OS-level security boundary. A plugin is untrusted code constrained by
-  the QuickJS engine and its limits — not by the operating system.
-- The Wasm module runs in the host process: a bug in the engine/Wasm
-  boundary is outside the plugin sandbox's reach.
-- CPU denial-of-service is bounded (timeouts), not eliminated.
-- Planned hardening (later phases): per-plugin OS-level isolation
-  (process/worker) and a capabilities-based API surface.
-- The security tests (`tests/security.test.ts`) demonstrate these
-  guarantees; they are not a proof of perfect sandbox security.
+Execution is bounded by the existing runtime time and memory limits. This is engine-level isolation, not an OS-level security boundary.
 
 ## HTTP capability (Phase 4)
 
-Plugins can perform real HTTP/HTTPS requests, but the engine mediates every
-one of them. The plugin calls a small `context.http` API; the host executes
-the request with Node's built-in `fetch` (undici); the response is reduced to
-a plain, JSON-serializable object before it ever touches the sandbox.
+Plugins make HTTP/HTTPS requests through `context.http`; the host performs the actual request.
 
 ```js
 const res = await context.http.get("https://example.com/api", {
   timeoutMs: 8000,
   headers: { accept: "application/json" },
 });
-// res = { status, statusText, headers, url, body }
-res.status;        // number, e.g. 200
-res.headers;       // { "content-type": "application/json", ... }
-res.url;           // final URL after any redirects
-res.body;          // full response body as a UTF-8 string
 
-const data = await context.http.getJson("https://example.com/api"); // parsed
-await context.http.request({ method: "POST", url, body, headers }); // any method
+res.status;
+res.headers;
+res.url;
+res.body;
+
+const data = await context.http.getJson("https://example.com/api");
 ```
 
-- **GET** is the common case; `request()` supports other methods.
-- A response is **data, not an error condition on status alone** — a `404`
-  resolves normally so the plugin can inspect it. Only transport/policy
-  problems reject.
-- **No browser.** This is a plain HTTP client: no DOM, no JS execution, no
-  scraping, no media/stream extraction. (See "Deliberate non-provisions" in
-  ARCHITECTURE.md.)
+Requests have engine-enforced limits for timeout, response size, redirects, and headers. URLs must be absolute `http:` or `https:` URLs.
 
-### Limits (engine-enforced, plugin can only lower them)
+The HTTP layer does **not** provide browser automation, CAPTCHA solving, Cloudflare bypass, DRM bypass, authentication bypass, or other security-control circumvention.
 
-Every option a plugin passes is clamped against hard engine maximums so a
-plugin can never force an unbounded request:
+HTTP tests use a local test server and do not depend on the public Internet.
 
-| Limit | Default (engine maximum) |
-| --- | --- |
-| `timeoutMs` (per request) | 30 000 ms (absolute cap) |
-| `maxResponseBytes` | 50 MiB hard cap |
-| `maxRedirects` | 10 hops |
-| header name/value length & count | bounded |
+## HTML + JSON capability (Phase 5)
 
-`timeoutMs`, `maxResponseBytes`, and `maxRedirects` may be supplied per call
-and are **clamped down** to these caps — a plugin can make a stricter limit,
-never a looser one. The engine maximums themselves are configurable at
-runtime construction via `new PluginRuntime({ http: { limits } })`.
+### JSON
 
-### Error model
+`context.json.parse` parses a bounded JSON string and returns JSON-compatible data.
 
-HTTP failures reject with a **structured** object (never a host stack trace):
+`context.json.stringify` serializes a JSON-compatible value.
 
-```js
-{ code: "HTTP_TIMEOUT", message: "Request timed out after 8000 ms" }
+Invalid JSON and values that exceed the engine's input limits are rejected with structured runtime errors.
+
+### HTML
+
+`context.html.parse` parses an HTML string into an engine-owned document representation.
+
+`context.html.select` supports:
+
+- `div`
+- `.card`
+- `#main`
+- `div.card`
+- `div .card`
+- basic attributes such as `[href]`, `[data-id]`, and `[class="item"]`
+
+`context.html.extract` returns normalized, JSON-serializable element information.
+
+The parser:
+
+- tolerates malformed HTML
+- normalizes extracted text
+- does not execute `<script>` contents
+- does not run event handlers
+- does not load external resources
+- never follows `href` or `src`
+- does not access cookies, browser storage, or filesystem
+
+Network access remains explicit: a plugin must call `context.http` to make a request.
+
+### Phase 5 limits
+
+The parser enforces bounded input/resource limits. The current implementation limits HTML input to approximately 5 MiB, JSON input to approximately 5 MiB, and parsed HTML nodes to 50,000. Plugins cannot raise these hard limits.
+
+## Testing
+
+The repository includes deterministic offline tests for:
+
+- foundation and manifest behavior
+- plugin runtime behavior
+- sandbox security
+- controlled HTTP
+- Phase 5 JSON parsing
+- Phase 5 HTML selectors and extraction
+- script/event-handler non-execution
+- unsupported selector rejection
+
+Run:
+
+```bash
+npm test
 ```
-
-Possible `code` values: `HTTP_INVALID_URL`, `HTTP_UNSUPPORTED_SCHEME`,
-`HTTP_TIMEOUT`, `HTTP_ABORTED`, `HTTP_NETWORK_ERROR`,
-`HTTP_RESPONSE_TOO_LARGE`, `HTTP_TOO_MANY_REDIRECTS`, `HTTP_INVALID_REQUEST`,
-`HTTP_INVALID_JSON`, `HTTP_INTERNAL_ERROR`.
-
-### Security model
-
-- **URLs must be absolute `http:`/`https:`.** `file:`, `data:`,
-  `javascript:`, `node:`, and every other scheme are rejected. Relative URLs
-  and anything that is not a valid absolute URL are rejected.
-- **Redirects are re-validated** against the same policy on every hop, and the
-  hop count is bounded — a redirect cannot escape to `file:` or to a
-  disallowed host.
-- **Headers are validated** (name/value character sets and lengths) and the
-  engine sets a small default `User-Agent`; host credentials and environment
-  information are never forwarded.
-- **No circumvention tooling.** This client does not include CAPTCHA solving,
-  Cloudflare/DRM/auth bypass, or any other security-control avoidance. It is a
-  plain, robust HTTP client and nothing more.
-- **Cancellation.** A request is tied to its executing operation: when the
-  operation's time limit trips or the plugin is disposed, in-flight requests
-  are aborted on the host side so nothing runs away.
-
-### Testing
-
-HTTP behavior is tested entirely against a **local** test server on
-`127.0.0.1` (see `tests/http.test.ts`); the test suite never depends on the
-public Internet.
 
 ## Documentation
 
-- [ARCHITECTURE.md](./ARCHITECTURE.md) — overall architecture. Phases 1–4
-  components are implemented; the rest is planned design.
+- `ARCHITECTURE.md` — overall engine architecture and phase boundaries.
+
+## Explicitly out of scope
+
+Phase 5 is **not** a media/stream extractor. It does not implement:
+
+- M3U8/MP4 stream extraction
+- media playback
+- DRM handling or bypass
+- CAPTCHA solving
+- Cloudflare/security-control bypass
+- authentication bypass
+- browser automation
+- JavaScript execution from scraped pages
+- UI/application code
+- plugin marketplace
+- database or large persistent cache
 
 ## Constraints
 
-- TypeScript, Node.js, npm; minimal dependencies.
-- No Electron, Flutter, React, Next.js, full web frameworks, databases,
-  Chromium, or Playwright.
-- No Cloudflare bypass, CAPTCHA solving, DRM/authentication bypassing, or
-  other security-control circumvention.
+- TypeScript, Node.js, npm
+- Keep dependencies small and understandable
+- No Electron, Flutter, React, Next.js, full web frameworks, databases, Chromium, Playwright, or Puppeteer
+- Never commit secrets, tokens, or credentials
 
 ## Rules for future phases
 
-1. Inspect the repository before modifying it; previous code may be
-   incomplete or inconsistent.
+1. Inspect the repository before modifying it.
 2. Run `npm test` before declaring a phase complete.
 3. Keep changes small and understandable.
-4. Do not implement future phases early; do not ship placeholder code.
+4. Do not implement future phases early.
 5. Never commit secrets, tokens, or credentials.

@@ -2,19 +2,13 @@
  * CLI for StreamPluginEngine.
  *
  * Commands:
- *   node dist/src/cli.js [list] [pluginsDir]        (default) — list plugins
- *   node dist/src/cli.js run <pluginId> [op] [jsonArgs]
- *                                                   — run a capability
- *
- * `list` mirrors `npm run plugins:list`.
- * `run` mirrors `npm run plugin:run -- <pluginId> [op] [jsonArgs]`.
- *
- * The run command loads a plugin, executes one capability in the
- * sandboxed runtime, prints the result, and shuts down cleanly.
+ *   node dist/src/cli.js [list] [pluginsDir]
+ *   node dist/src/cli.js run <pluginId> <operation> [jsonArgs]
  */
 import path from "node:path";
 import process from "node:process";
 
+import "./phase5.js";
 import { PluginManager } from "./manager.js";
 import { PluginRuntime } from "./runtime.js";
 
@@ -35,14 +29,11 @@ async function listPlugins(pluginsDirArg?: string): Promise<void> {
   const plugins = manager.listPlugins();
   console.log("Plugins");
   console.log(RULE);
-  if (plugins.length === 0) {
-    console.log(`(no plugins found in ${pluginsDir})`);
-  }
+  if (plugins.length === 0) console.log(`(no plugins found in ${pluginsDir})`);
+
   for (const plugin of plugins) {
     const manifest = plugin.manifest;
-    if (!manifest) {
-      continue;
-    }
+    if (!manifest) continue;
     console.log(manifest.name);
     console.log(`ID: ${manifest.id}`);
     console.log(`Version: ${manifest.version}`);
@@ -56,9 +47,7 @@ async function listPlugins(pluginsDirArg?: string): Promise<void> {
     console.log(RULE);
     for (const problem of problems) {
       console.log(problem.pluginPath);
-      for (const error of problem.errors ?? []) {
-        console.log(`  - ${error}`);
-      }
+      for (const error of problem.errors ?? []) console.log(`  - ${error}`);
       console.log("");
     }
   }
@@ -76,7 +65,7 @@ async function runPlugin(
       parsed = JSON.parse(argsJson);
     } catch {
       console.error(
-        "Invalid arguments: expected JSON — an array of arguments, e.g. [\"query\"], or a single value, e.g. \"query\"",
+        'Invalid arguments: expected JSON — an array of arguments, e.g. ["query"], or a single value, e.g. "query"',
       );
       process.exitCode = 1;
       return;
@@ -160,7 +149,6 @@ async function main(): Promise<void> {
     return;
   }
 
-  // Default (and explicit "list"): list plugins. "list" may be omitted.
   const listDir = command === "list" ? rest[0] : command;
   await listPlugins(listDir);
 }
