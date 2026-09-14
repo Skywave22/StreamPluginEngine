@@ -2,11 +2,18 @@
 
 Lightweight, cross-platform plugin engine for a future media/streaming application. This repository contains the **engine only** — no UI, browser automation, or media-player application.
 
-## Current status: Phase 6 (final phase) — PROJECT COMPLETE
+## Current status: Phases 1–6 complete + Phase 7 validation tooling
 
-**Phase 6 is the final project phase.** All six phases are implemented,
-audited, and tested; no Phase 7 exists (see the roadmap in
-`ARCHITECTURE.md`).
+**Phases 1–6 are the production runtime and are complete.** Phase 7 is
+final validation and developer-only tooling (security regression, CLI
+end-to-end, and lifecycle/concurrency tests plus a benchmark harness); it
+adds no runtime capability. See the roadmap in `ARCHITECTURE.md`.
+
+An independent audit of the source, tests, and Git history found and fixed
+four real defects in the Phase 1–6 layers — a missing network/SSRF policy,
+a prototype-chain bug in response-header collection, an interrupt-handler
+race that could hang the host process, and a QuickJS teardown abort when a
+plugin was disposed mid-request. Each has a regression test.
 
 Phases 1–5 remain implemented:
 
@@ -115,6 +122,7 @@ npm run build
 npm test
 npm run plugins:list
 npm run plugin:run -- example.source test
+npm run bench          # optional: developer-only benchmark harness
 ```
 
 `npm test` builds the TypeScript project first and then runs the built-in Node.js test runner.
@@ -122,8 +130,9 @@ npm run plugin:run -- example.source test
 ## Project layout
 
 ```text
-src/        Engine source
-tests/      Tests
+src/        Engine source (production runtime — Phases 1-6)
+tests/      Tests (correctness suite, run by `npm test`)
+tools/      Developer-only tooling (benchmark harness — Phase 7)
 plugins/    Example plugin
 dist/       Build output (generated, not committed)
 ```
@@ -191,6 +200,29 @@ const data = await context.http.getJson("https://example.com/api");
 ```
 
 Requests have engine-enforced limits for timeout, response size, redirects, and headers. URLs must be absolute `http:` or `https:` URLs.
+
+### Network policy (SSRF defence)
+
+Beyond the scheme check, every request TARGET is validated against the engine network policy (`src/network.ts`). Under the default policy a plugin **cannot** reach:
+
+- loopback (`127.0.0.0/8`, `::1`, `localhost`)
+- private ranges (`10/8`, `172.16/12`, `192.168/16`, `fc00::/7`)
+- link-local (`169.254/16`, `fe80::/10`) — including cloud metadata endpoints such as `169.254.169.254`
+- CGNAT, multicast, and other reserved ranges
+- IPv4-mapped IPv6 (`::ffff:7f00:1`) and IPv4-embedding tunnels (6to4, NAT64, Teredo)
+- obfuscated IPv4 literals (`2130706433`, `0x7f.1`, `0177.0.0.1`) — the URL parser normalises these first
+
+Blocked targets fail with the structured code `HTTP_FORBIDDEN_TARGET` **before any I/O**. Hostnames are DNS-resolved and every resolved address is checked, and the policy is re-applied to every redirect hop.
+
+Host applications opt in to internal ranges explicitly — this is a host decision a plugin can never make for itself:
+
+```js
+const runtime = new PluginRuntime({
+  http: { network: { allowPrivateNetwork: true } }, // local dev / test fixtures
+});
+```
+
+Residual risk, stated plainly: the policy resolves DNS to decide and the request resolves DNS again to connect, so a hostile authoritative server can still rebind between the two. Fully closing that needs connection-level address pinning. Deployments running untrusted plugins should also apply OS/network-level egress controls — this is engine-level defence in depth, not an OS boundary.
 
 The HTTP layer does **not** provide browser automation, CAPTCHA solving, Cloudflare bypass, DRM bypass, authentication bypass, or other security-control circumvention.
 
@@ -404,11 +436,47 @@ The repository includes deterministic offline tests for:
 - Phase 6 security (malicious plugin output, prototype-pollution
   attempts, strange objects, huge values)
 
+Phase 7 adds the validation layer that closes the gaps an independent audit
+found:
+
+- **network policy / SSRF regression** (`tests/network-policy.test.ts`) —
+  address-range classification, cloud metadata endpoints, IPv4-mapped IPv6
+  and tunnel-prefix smuggling, obfuscated IPv4 literals, `localhost`,
+  hostname resolution (injected resolver, so no real DNS), mixed
+  public/private resolution, redirect-hop enforcement (mocked `fetch`, so no
+  external host), and guest-level proof that a plugin cannot reach internal
+  targets or grant itself permission
+- **HTTP header prototype-chain regression** (`tests/http.test.ts`) —
+  server-controlled headers named after `Object.prototype` members are no
+  longer corrupted and no longer leak host function source text; genuine
+  duplicate headers still join with `", "`; a `__proto__` request header is
+  rejected rather than silently dropped
+- **CLI end-to-end** (`tests/cli.test.ts`) — the built CLI is run as a real
+  child process: `list`/no-arg discovery, empty and missing directories,
+  problem reporting, `run` with array/scalar/no JSON arguments, log routing,
+  unknown plugin, unknown capability, malformed arguments, load failures,
+  cwd-relative `plugins/` resolution, and exit codes
+- **lifecycle, stability, and concurrency** (`tests/lifecycle.test.ts`) —
+  repeated execution, repeated load/dispose cycles, module-state isolation
+  between loads, runtime re-creation after shutdown, idempotent
+  dispose/shutdown, execution after dispose, cross-runtime handle rejection,
+  concurrent operations on different plugins, serialized operations on one
+  plugin, queue recovery after a failed operation, and disposal while an
+  HTTP request is in flight. The overlapping-operation timeout regression
+  runs in a **child process with a hard timeout**, so if the interrupt-handler
+  race ever returns the test fails cleanly instead of freezing the suite.
+
 Run:
 
 ```bash
-npm test
+npm test        # correctness suite (225 tests, offline, deterministic)
+npm run bench   # developer-only benchmarks — NOT part of the test suite
 ```
+
+Benchmarks are deliberately kept out of `npm test`: timing assertions are
+flaky and would not test correctness. `tools/benchmark.mjs` is not imported
+by `src/` and is not part of the public API, so it adds no runtime cost to
+engine consumers.
 
 ## Documentation
 
@@ -439,8 +507,8 @@ The engine (Phases 1–6) is **not** a media/stream extractor. It does not imple
 
 ## Rules for maintainers
 
-The project is complete (Phase 6 is the final phase). For any future
-maintenance work:
+The project is complete: Phases 1–6 are the production runtime, and Phase 7
+is developer-only validation tooling. For any future maintenance work:
 
 1. Inspect the repository before modifying it.
 2. Run `npm test` before declaring a change complete.

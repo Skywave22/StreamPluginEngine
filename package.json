@@ -22,6 +22,7 @@
     "build": "tsc",
     "clean": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true });\"",
     "test": "npm run build && node --test dist/tests/",
+    "bench": "npm run build && node tools/benchmark.mjs",
     "plugins:list": "npm run build && node dist/src/cli.js",
     "plugin:run": "npm run build && node dist/src/cli.js run"
   },

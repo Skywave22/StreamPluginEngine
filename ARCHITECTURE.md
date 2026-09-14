@@ -1,11 +1,12 @@
 # Architecture
 
 Status: the layering below is the implemented design of the FINAL project
-state. **All six phases are implemented: Phase 1 (foundation), 2
+state. **All six runtime phases are implemented: Phase 1 (foundation), 2
 (plugin manifest + loader), 3 (sandboxed plugin runtime), 4
-(engine-controlled HTTP), 5 (HTML + JSON parsing capabilities), and 6
-(normalized source result pipeline). Phase 6 is the final project
-phase — the engine is complete.**
+(engine-controlled HTTP + network policy), 5 (HTML + JSON parsing
+capabilities), and 6 (normalized source result pipeline). Phase 7 is
+final validation and developer-only tooling — it adds no runtime
+capability. The engine is complete.**
 
 ## Layering
 
@@ -173,7 +174,7 @@ Plugin receives a plain object (or a structured { code, message } error)
   (see `HTTP_ERROR_CODES`), never a host stack trace. Examples:
   `HTTP_TIMEOUT`, `HTTP_INVALID_URL`, `HTTP_UNSUPPORTED_SCHEME`,
   `HTTP_RESPONSE_TOO_LARGE`, `HTTP_TOO_MANY_REDIRECTS`,
-  `HTTP_NETWORK_ERROR`, `HTTP_INVALID_JSON`.
+  `HTTP_FORBIDDEN_TARGET`, `HTTP_NETWORK_ERROR`, `HTTP_INVALID_JSON`.
 - **Security.** URLs must be absolute `http:`/`https:`; other schemes
   (`file:`, `data:`, `javascript:`, `node:`, …) and relative URLs are
   rejected. Each redirect hop is re-validated against the same policy and
@@ -184,9 +185,31 @@ Plugin receives a plain object (or a structured { code, message } error)
 - **Cancellation & concurrency.** Each executing operation gets its own
   `AbortController`; when the operation's time limit trips or the plugin is
   disposed, all of its in-flight HTTP requests are aborted on the host, so
-  nothing runs away. Concurrency is per-plugin by construction (one QuickJS
-  runtime per plugin); a per-plugin cap on simultaneous in-flight requests
-  is future work, not a global scheduler.
+  nothing runs away. Operations on ONE plugin are **serialized** (see
+  `LoadedPluginHandle.queue` in `src/runtime.ts`): a QuickJS runtime has a
+  single interrupt-handler slot and a single job queue, so overlapping
+  operations would race on the timeout guard and could leave an operation
+  running with no deadline at all. Different plugins have different runtimes
+  and still execute concurrently. A per-plugin cap on simultaneous in-flight
+  requests is future work, not a global scheduler.
+- **Network policy (SSRF defence).** `src/network.ts` decides which request
+  TARGETS are reachable, independently of the scheme check. By default
+  loopback, RFC 1918, CGNAT, link-local (including cloud metadata endpoints
+  such as `169.254.169.254`), multicast, and other reserved ranges are
+  rejected with `HTTP_FORBIDDEN_TARGET` before any I/O. Hostnames are
+  resolved and EVERY resolved address is checked, so a name pointing at an
+  internal host is rejected too. IPv4-mapped IPv6 (`::ffff:7f00:1`) and
+  IPv4-embedding tunnel prefixes (6to4, NAT64, Teredo) cannot be used to
+  smuggle a blocked address. The check runs on the initial URL and on every
+  redirect hop. A host application may opt in to private ranges with
+  `{ http: { network: { allowPrivateNetwork: true } } }` — that is what
+  local development and the offline test suite use. A plugin can never
+  influence the policy.
+  Residual risk, stated plainly: the policy resolves DNS to decide, and the
+  request resolves DNS again to connect, so a hostile authoritative server
+  can still rebind between the two. Closing that needs connection-level
+  address pinning, which is beyond a lightweight engine; deployments running
+  untrusted plugins should also apply OS/network-level egress controls.
 
 **Deliberate non-provisions (Phase 4)** — intentionally NOT implemented, by
 design: browser automation (no Chromium/Playwright/Puppeteer), DOM/HTML
@@ -357,10 +380,10 @@ they are not engine phases and are not implemented here:
   unregister; on/off policy is an application decision)
 - Parallel plugin execution with per-plugin scheduling (the runtime is
   concurrency-safe per plugin; a scheduler is an application concern)
-- Benchmarking/observability dashboards (the deterministic offline test
-  suite — `npm test` — is the engine's quality gate; benchmarking
-  infrastructure was evaluated and is NOT required for engine
-  completeness, which is why no Phase 7 exists)
+- Benchmarking/observability dashboards. A minimal, developer-only
+  benchmark harness exists (`tools/benchmark.mjs`, `npm run bench`); it is
+  validation tooling, not a runtime feature, and is not part of the engine's
+  public API or the test suite
 
 (Implemented: manifest schema + validation, discovery, loading, manager,
 sandboxed JavaScript execution, controlled context, per-operation
@@ -404,8 +427,20 @@ central validation, normalization, and explicit limits.)
   URL policy, explicit limits, prototype-pollution-safe metadata,
   structured errors. **Final project phase.** *(complete)*
 
-**PROJECT COMPLETE.** No Phase 7 exists: the only candidate (testing and
-benchmarking tooling) was evaluated during the final audit and found to be
-optional developer tooling, not a requirement for engine completeness —
-the deterministic offline test suite (`npm test`) already serves as the
-engine's quality gate. The roadmap is closed.
+- **Phase 7** — Final validation and developer tooling. *(complete —
+  developer-only; adds no production runtime capability)* An independent
+  audit of the actual source, tests, and Git history found that the
+  "Phase 6 is complete, no Phase 7 needed" claim was premature: the audit
+  reproduced three real defects (a missing SSRF/network policy, a
+  prototype-chain bug in response-header collection, and an
+  interrupt-handler race that could hang the host process) plus a QuickJS
+  teardown abort when a plugin was disposed mid-request. Those were fixed
+  in the Phase 1–6 layers. Phase 7 is the validation layer that locks the
+  fixes down and closes the coverage gaps the audit exposed: a network
+  policy / SSRF regression suite, CLI end-to-end tests (the CLI had none),
+  and lifecycle/concurrency/teardown tests. It also adds a small
+  developer-only benchmark harness. Phase 7 changes no production runtime
+  behaviour of its own.
+
+**PROJECT COMPLETE.** Production runtime capabilities are Phases 1 → 6;
+Phase 7 is developer-only validation tooling. The roadmap is closed.
