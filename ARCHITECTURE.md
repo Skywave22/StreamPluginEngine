@@ -1,8 +1,8 @@
 # Architecture (planned)
 
-Status: the layering below is the overall design. **Phase 1 (foundation)
-and Phase 2 (plugin manifest + loader) are implemented; everything else is
-still planned and not implemented.**
+Status: the layering below is the overall design. **Phases 1 (foundation),
+2 (plugin manifest + loader), and 3 (sandboxed plugin runtime) are
+implemented; everything else is still planned and not implemented.**
 
 ## Layering
 
@@ -70,8 +70,53 @@ TypeScript + Node.js project scaffold, toolchain, tests.
 The loader reads and validates manifests only; executing plugin code in a
 sandbox is the responsibility of the Plugin Runtime in Phase 3.
 
-Example plugin: `plugins/example/` (manifest.json + harmless placeholder
-plugin.js) is used by the tests and the `npm run plugins:list` CLI.
+Example plugin: `plugins/example/` (manifest.json + plugin.js) is used by
+the tests and the `npm run plugins:list` CLI.
+
+### Phase 3 — Sandboxed plugin runtime (executes plugin code)
+
+- Runtime technology: **QuickJS compiled to WebAssembly**
+  (`quickjs-emscripten`). QuickJS is a mature, actively maintained
+  embedded JavaScript engine. It runs as a *separate* engine from the
+  host Node.js process, so plugin realms contain no Node.js globals, no
+  host objects, and no built-in modules by construction. `node:vm` was
+  explicitly rejected: it is documented by Node.js as not a security
+  boundary.
+- `PluginRuntime` (`src/runtime.ts`) — loads a plugin's entry module into
+  a fresh, isolated QuickJS runtime (one per plugin, capped guest heap),
+  inspects the `plugin` export to detect capabilities, executes them with
+  JSON arguments + a controlled context, and returns structured results.
+  Execution uses QuickJS interrupt hooks for timeouts and a host-side
+  deadline for promises that never settle.
+- Plugin contract — the entry module (ES module) exports an object named
+  `plugin`; each function property is a capability. Capabilities receive
+  their arguments first and the `PluginContext` last.
+- `PluginContext` (`src/types.ts`) — the only host surface a plugin
+  receives: `manifest` (read-only) and `log(...)`. Deliberately tiny in
+  Phase 3.
+- `PluginExecutionResult` / `PluginLoadResult` / `PluginRuntimeError`
+  (`src/types.ts`) — consistent structured outcomes with measured
+  execution times; error types: `PLUGIN_LOAD_ERROR`,
+  `PLUGIN_EXPORT_ERROR`, `PLUGIN_RUNTIME_ERROR`, `PLUGIN_TIMEOUT`,
+  `PLUGIN_MEMORY_LIMIT`, `PLUGIN_CAPABILITY_NOT_FOUND`.
+- Module loading — a per-plugin module loader resolves `import` specifiers
+  ONLY to files inside the plugin's own directory; host/built-in
+  (`node:*`), absolute, and escaping (`..`) imports are rejected.
+
+**Plugin JavaScript execution is implemented in Phase 3, but network and
+scraping APIs are intentionally not implemented in Phase 3.** There is no
+HTTP, no HTML parsing, no DOM, and no capability for a plugin to reach a
+website. Those belong to the Plugin API v1 capabilities in Phase 4.
+
+Sandbox limitations (do not mistake engine isolation for OS isolation):
+
+- QuickJS runs in-process on WebAssembly: this is engine-level isolation,
+  NOT an OS-level security boundary.
+- CPU DoS is bounded by the per-operation timeout; memory is bounded by
+  the per-plugin heap limit; both are configurable `PluginRuntimeOptions`.
+- A bug in the engine/Wasm boundary is outside the sandbox's reach.
+- Future hardening: per-plugin OS-level isolation and a
+  capabilities-based Plugin API.
 
 ## Planned plugin entry-point types (not implemented)
 
@@ -82,14 +127,16 @@ plugin.js) is used by the tests and the `npm run plugins:list` CLI.
 
 ## Planned engine features (not implemented)
 
-- Sandboxed JavaScript execution
 - Plugin enable/disable (the manager only has registry-level unregister)
 - HTTP requests (capability, with timeouts)
 - HTML parsing (capability)
 - JSON parsing (capability)
 - Parallel plugin execution with per-plugin timeouts
-- Runtime error isolation (Phase 2 only isolates discovery/loading failures)
 - Testing and benchmarking hooks
+
+(Implemented so far: manifest schema + validation, discovery, loading,
+manager, sandboxed JavaScript execution, controlled context, per-operation
+timeouts, memory limits, and error isolation at the load/execute level.)
 
 ## Design constraints
 
@@ -106,8 +153,10 @@ plugin.js) is used by the tests and the `npm run plugins:list` CLI.
 - **Phase 1** — Repository foundation, toolchain, this document. *(complete)*
 - **Phase 2** — Plugin manifest schema, validation, discovery, loading,
   plugin manager, example plugin, CLI. *(complete)*
-- **Phase 3** — Sandboxed plugin runtime and Plugin API v1 (HTTP, JSON,
-  HTML capabilities); per-plugin enable/disable.
-- **Phase 4** — Standard plugin entry points (search, details, episodes,
+- **Phase 3** — Sandboxed plugin runtime (QuickJS/Wasm), plugin export
+  contract, controlled context, timeouts, memory limits, error isolation,
+  `plugin:run` CLI. *(complete)*
+- **Phase 4** — Plugin API v1 capabilities (HTTP, JSON, HTML), per-plugin
+  enable/disable; standard plugin entry points (search, details, episodes,
   sources); parallel execution and timeouts.
 - **Phase 5** — Testing and benchmarking tooling.

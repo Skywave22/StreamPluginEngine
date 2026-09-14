@@ -10,5 +10,5 @@ import {
 test("foundation compiles and exports engine identity", () => {
   assert.equal(ENGINE_NAME, "stream-plugin-engine");
   assert.equal(ENGINE_VERSION, "0.1.0");
-  assert.equal(ENGINE_PHASE, 2);
+  assert.equal(ENGINE_PHASE, 3);
 });

@@ -22,10 +22,14 @@
     "build": "tsc",
     "clean": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true });\"",
     "test": "npm run build && node --test dist/tests/",
-    "plugins:list": "npm run build && node dist/src/cli.js"
+    "plugins:list": "npm run build && node dist/src/cli.js",
+    "plugin:run": "npm run build && node dist/src/cli.js run"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
     "typescript": "^5.5.0"
+  },
+  "dependencies": {
+    "quickjs-emscripten": "^0.32.0"
   }
 }
