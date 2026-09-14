@@ -455,6 +455,95 @@ test("sandbox boundary: no process / require / host fetch reachable from Phase 5
   assert.equal(value.htmlOk, true);
 });
 
+test("html.parse: deep nesting within the guest boundary works end to end", async (t) => {
+  // ~500 nesting levels is the sandbox value-delivery boundary; 300
+  // levels is safely inside it. This proves the full path
+  // (guest string -> host parse -> JSON back into the guest -> select).
+  const value = (await runCapability(
+    t,
+    `export const plugin = {
+      run: async (context) => {
+        const depth = 300;
+        const html = "<div>".repeat(depth) + '<i id="bottom">b</i>' + "</div>".repeat(depth);
+        const doc = await context.html.parse(html);
+        const matches = await context.html.select(doc, "#bottom");
+        if (matches.length !== 1) return { ok: false, count: matches.length };
+        const info = await context.html.extract(matches[0]);
+        return { ok: true, tag: info.tagName, text: info.text };
+      },
+    };`,
+    "htmldeepok",
+    "run",
+  )) as Record<string, unknown>;
+  assert.equal(value.ok, true);
+  assert.equal(value.tag, "i");
+  assert.equal(value.text, "b");
+});
+
+test("html.parse: beyond the guest depth boundary is a structured HTML_PARSE_ERROR", async (t) => {
+  // 2,000 levels exceeds the ~500-level sandbox delivery boundary. The
+  // engine must fail with a structured error (never a crash), and the
+  // message must be engine-controlled.
+  const value = (await runCapability(
+    t,
+    `export const plugin = {
+      run: async (context) => {
+        const depth = 2000;
+        const html = "<div>".repeat(depth) + "x" + "</div>".repeat(depth);
+        try {
+          await context.html.parse(html);
+          return { handled: true };
+        } catch (e) {
+          return { handled: false, code: e && e.code, message: e && e.message };
+        }
+      },
+    };`,
+    "htmldeepbad",
+    "run",
+  )) as Record<string, unknown>;
+  assert.equal(value.handled, false);
+  assert.equal(value.code, "HTML_PARSE_ERROR");
+  assert.equal(typeof value.message, "string");
+  assert.ok(/too deep/i.test(value.message as string), `depth message: ${value.message}`);
+  assert.ok(!/at |\.js:|node_modules/i.test(value.message as string), "no host stack in message");
+});
+
+test("stability: the same plugin executes repeatedly without degradation", async (t) => {
+  const base = await temp(t);
+  const p = await plugin(
+    base,
+    "repeat",
+    `export const plugin = {
+      run: (n, context) => {
+        const doc = context.html.parse('<a id="a" href="/1">one</a>');
+        const el = context.html.select(doc, "#a");
+        const info = context.html.extract(el[0]);
+        return { n, href: info.href, json: context.json.stringify({ n }) };
+      },
+    };`,
+  );
+  const runtime = new PluginRuntime();
+  t.after(() => runtime.shutdown());
+  const loaded = await runtime.loadPlugin(p);
+  assert.equal(loaded.ok, true);
+  if (!loaded.ok) throw new Error("unreachable");
+  for (let n = 1; n <= 5; n++) {
+    const result = await runtime.execute(loaded.plugin, "run", [n]);
+    assert.equal(
+      result.success,
+      true,
+      result.success ? "" : `iteration ${n} failed: ${result.error.type}`,
+    );
+    if (result.success) {
+      assert.deepEqual(result.value, {
+        n,
+        href: "/1",
+        json: `{"n":${n}}`,
+      });
+    }
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Full pipelines (HTTP -> HTML -> select -> extract; HTTP -> JSON)
 // ---------------------------------------------------------------------------

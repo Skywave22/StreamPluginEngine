@@ -331,6 +331,23 @@ test("security: the raw input object is never mutated", () => {
 
 // --- constants --------------------------------------------------------------------
 
+test("stress: exactly maxResults valid results pass, and stay fast/bounded", () => {
+  // The upper bound of the result pipeline under a legitimate maximum
+  // load (deterministic; no timing assertion — only correctness).
+  const items = Array.from({ length: RESULT_LIMITS.maxResults }, (_, i) => ({
+    id: `id-${i}`,
+    title: `Title ${i}`,
+    type: "search",
+    url: `https://example.com/item/${i}`,
+    metadata: { rank: i },
+  }));
+  const results = ok(items);
+  assert.equal(results.length, RESULT_LIMITS.maxResults);
+  assert.equal(results[0]?.id, "id-0");
+  assert.equal(results[RESULT_LIMITS.maxResults - 1]?.id, `id-${RESULT_LIMITS.maxResults - 1}`);
+  assert.equal(results[0]?.metadata.rank, 0);
+});
+
 test("constants: limits and error codes are coherent", () => {
   assert.ok(RESULT_LIMITS.maxResults > 0);
   assert.ok(RESULT_LIMITS.maxIdLength > 0);

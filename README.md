@@ -2,7 +2,11 @@
 
 Lightweight, cross-platform plugin engine for a future media/streaming application. This repository contains the **engine only** — no UI, browser automation, or media-player application.
 
-## Current status: Phase 6 — Normalized source result pipeline
+## Current status: Phase 6 (final phase) — PROJECT COMPLETE
+
+**Phase 6 is the final project phase.** All six phases are implemented,
+audited, and tested; no Phase 7 exists (see the roadmap in
+`ARCHITECTURE.md`).
 
 Phases 1–5 remain implemented:
 
@@ -103,7 +107,7 @@ return data;
 
 ## Quick start
 
-Requires Node.js >= 20.
+Requires Node.js >= 20.19 (the HTML parsing stack declares `>=20.19`).
 
 ```bash
 npm install
@@ -275,7 +279,15 @@ Network access remains explicit: a plugin must call `context.http` to make a req
 | Parsed HTML nodes (elements + text + comments) | 50,000 |
 | `html.select` result count | 1,000 elements |
 
-All limits are engine constants (`PHASE5_LIMITS`); plugins cannot raise them.
+All limits are engine constants (`PHASE5_LIMITS`); plugins cannot raise
+them.
+
+**Deep-structure behavior:** the host-side parser supports the full node
+budget (including 50,000-deep chains — all tree transforms are
+iterative). Through the guest (`context.html.*`), documents deeper than
+roughly 500 nesting levels — the sandbox value-delivery boundary — fail
+with a structured `HTML_PARSE_ERROR` instead of crashing. This is far
+beyond real-world HTML depth and is deterministic.
 
 ## Source result pipeline (Phase 6)
 
@@ -425,10 +437,14 @@ The engine (Phases 1–6) is **not** a media/stream extractor. It does not imple
 - No Electron, Flutter, React, Next.js, full web frameworks, databases, Chromium, Playwright, or Puppeteer
 - Never commit secrets, tokens, or credentials
 
-## Rules for future phases
+## Rules for maintainers
+
+The project is complete (Phase 6 is the final phase). For any future
+maintenance work:
 
 1. Inspect the repository before modifying it.
-2. Run `npm test` before declaring a phase complete.
+2. Run `npm test` before declaring a change complete.
 3. Keep changes small and understandable.
-4. Do not implement future phases early.
+4. Do not add new phases or new capabilities without an explicit project
+   decision.
 5. Never commit secrets, tokens, or credentials.

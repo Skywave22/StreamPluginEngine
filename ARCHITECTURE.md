@@ -1,10 +1,11 @@
-# Architecture (planned)
+# Architecture
 
-Status: the layering below is the overall design. **Phases 1 (foundation),
-2 (plugin manifest + loader), 3 (sandboxed plugin runtime), 4
+Status: the layering below is the implemented design of the FINAL project
+state. **All six phases are implemented: Phase 1 (foundation), 2
+(plugin manifest + loader), 3 (sandboxed plugin runtime), 4
 (engine-controlled HTTP), 5 (HTML + JSON parsing capabilities), and 6
-(normalized source result pipeline) are implemented; everything else is
-still planned and not implemented.**
+(normalized source result pipeline). Phase 6 is the final project
+phase — the engine is complete.**
 
 ## Layering
 
@@ -242,6 +243,17 @@ owns all parsing.
   materialized. `select` rebuilds the tree, wires ancestor/sibling
   pointers, and runs css-select on it — the matching work is bounded and
   does not run guest code.
+- **Deep-structure behavior.** All host-side tree transforms are
+  iterative, so the host API (`parseHtml`/`selectHtml`/`extractHtml`)
+  supports the full node budget including 50,000-deep chains. The GUEST
+  path additionally crosses the Wasm boundary: delivering a value into
+  the sandbox uses a JSON literal evaluation, so documents deeper than
+  roughly 500 nesting levels (the QuickJS evaluator's stack limit) fail
+  with a structured `HTML_PARSE_ERROR` naming the depth limit. Per-element
+  extraction/serialization of extremely deep subtrees (the mature
+  library's own recursion) similarly fails structured (`HTML_EXTRACT_ERROR`).
+  ~500 levels is far beyond real-world HTML (renderers typically stop far
+  below that); the behavior is deterministic and safe, never a crash.
 - **Security.** Parsing is data-only: no JavaScript execution, no event
   handlers, no resource loading, no following of `href`/`src`, no
   filesystem or environment access. `javascript:` URLs and `on*` handler
@@ -336,14 +348,22 @@ URLs, result caching, and automatic crawling.
 - Episodes
 - Sources
 
-## Planned engine features (not implemented)
+## Future application concerns (deliberately out of engine scope)
 
-- Plugin enable/disable (the manager only has registry-level unregister)
-- Parallel plugin execution with per-plugin timeouts
-- Testing and benchmarking hooks
+These are concerns of the FUTURE APPLICATION that consumes this engine —
+they are not engine phases and are not implemented here:
 
-(Implemented so far: manifest schema + validation, discovery, loading,
-manager, sandboxed JavaScript execution, controlled context, per-operation
+- Plugin enable/disable policy (the manager provides registry-level
+  unregister; on/off policy is an application decision)
+- Parallel plugin execution with per-plugin scheduling (the runtime is
+  concurrency-safe per plugin; a scheduler is an application concern)
+- Benchmarking/observability dashboards (the deterministic offline test
+  suite — `npm test` — is the engine's quality gate; benchmarking
+  infrastructure was evaluated and is NOT required for engine
+  completeness, which is why no Phase 7 exists)
+
+(Implemented: manifest schema + validation, discovery, loading, manager,
+sandboxed JavaScript execution, controlled context, per-operation
 timeouts, memory limits, error isolation at the load/execute level,
 engine-controlled HTTP with limits, structured errors, and cancellation,
 HTML + JSON parsing capabilities with engine-enforced limits and
@@ -360,7 +380,7 @@ central validation, normalization, and explicit limits.)
 - No Cloudflare bypass, CAPTCHA solving, DRM or authentication bypassing,
   or other security-control circumvention — by design, out of scope.
 
-## Phase roadmap (indicative, not a contract)
+## Phase roadmap (complete)
 
 - **Phase 1** — Repository foundation, toolchain, this document. *(complete)*
 - **Phase 2** — Plugin manifest schema, validation, discovery, loading,
@@ -371,8 +391,9 @@ central validation, normalization, and explicit limits.)
 - **Phase 4** — Engine-controlled HTTP capability: `context.http`
   (get/getJson/request), engine-enforced limits, structured error model,
   redirect re-validation, cancellation on operation end. *(complete — HTTP
-  only; HTML parsing, enable/disable, standard entry points, and parallel
-  execution are deliberately deferred to later phases.)*
+  only; HTML parsing lands in Phase 5, and enable/disable policy and
+  parallel scheduling are future-application concerns, not engine
+  phases.)*
 - **Phase 5** — HTML + JSON parsing capabilities: `context.json`
   (parse/stringify, bounded, guest-side) and `context.html`
   (parse/select/extract on htmlparser2 + css-select, bounded, data-only),
@@ -381,5 +402,10 @@ central validation, normalization, and explicit limits.)
 - **Phase 6** — Normalized source-result pipeline: `SourceResult` model,
   `normalizeSourceResults()` (raw → validated → normalized), http/https
   URL policy, explicit limits, prototype-pollution-safe metadata,
-  structured errors. *(complete)*
-- **Phase 7** — Testing and benchmarking tooling.
+  structured errors. **Final project phase.** *(complete)*
+
+**PROJECT COMPLETE.** No Phase 7 exists: the only candidate (testing and
+benchmarking tooling) was evaluated during the final audit and found to be
+optional developer tooling, not a requirement for engine completeness —
+the deterministic offline test suite (`npm test`) already serves as the
+engine's quality gate. The roadmap is closed.

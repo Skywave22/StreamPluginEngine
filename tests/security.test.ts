@@ -97,7 +97,56 @@ test("host globals are unavailable inside the sandbox", async (t) => {
   }
 });
 
-test("the plugin context surface is exactly http + json + html + log + manifest (Phase 5)", async (t) => {
+test("eval and Function exist but stay confined to the guest realm (no host escape)", async (t) => {
+  // The sandbox intentionally does not delete the JS `eval`/`Function`
+  // built-ins: they execute code in the GUEST realm only. This test pins
+  // the security-relevant fact that dynamic code execution CANNOT reach
+  // the host — no Node globals, no host objects, no module loading.
+  const base = await makeTempDir(t);
+  const plugin = await writePlugin(
+    base,
+    "dyn",
+    `export const plugin = {
+      probe: () => {
+        const out = {};
+        out.evalType = typeof eval;
+        // eval runs, but only against the guest global (no process).
+        try { out.evalProcess = eval("typeof process"); } catch { out.evalProcess = "threw"; }
+        try { out.evalArith = eval("6 * 7"); } catch { out.evalArith = "threw"; }
+        // The Function constructor builds guest-realm functions only.
+        try { out.fnProcess = new Function("return typeof process")(); } catch { out.fnProcess = "threw"; }
+        // A direct reference to an undeclared host name throws (no leakage).
+        try { new Function("return process")(); out.directRef = "resolved"; }
+        catch { out.directRef = "threw"; }
+        // The guest global is not the host global.
+        out.gtProcess = typeof globalThis.process;
+        out.gtRequire = typeof globalThis.require;
+        return out;
+      },
+    };`,
+  );
+  const runtime = new PluginRuntime();
+  t.after(() => runtime.shutdown());
+
+  const load = await runtime.loadPlugin(plugin);
+  assert.equal(load.ok, true);
+  if (!load.ok) return;
+  const result = await runtime.execute(load.plugin, "probe");
+  assert.ok(result.success, result.success ? "" : JSON.stringify(result.error));
+  if (result.success) {
+    assert.deepEqual(result.value, {
+      evalType: "function",
+      evalProcess: "undefined",
+      evalArith: 42,
+      fnProcess: "undefined",
+      directRef: "threw",
+      gtProcess: "undefined",
+      gtRequire: "undefined",
+    });
+  }
+});
+
+test("the plugin context surface is exactly http + json + html + log + manifest (unchanged through Phase 6)", async (t) => {
   // Phase 5 adds context.json and context.html to the Phase 4 surface
   // (manifest + log + http). The surface must stay exactly this
   // controlled set — no host objects.

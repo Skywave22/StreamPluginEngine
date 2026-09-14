@@ -168,6 +168,35 @@ test("parseHtml: empty input is an empty document", () => {
   assert.deepEqual(doc, { type: "document", children: [] });
 });
 
+test("parseHtml: very deep nesting parses (iterative transforms, full node budget)", () => {
+  // Regression: recursive tree transforms overflowed the host stack at
+  // ~3,000 levels. All transforms are iterative now, so depth is bounded
+  // only by the node budget.
+  const deep = parseHtml("<div>".repeat(40_000) + "leaf" + "</div>".repeat(40_000));
+  assert.equal(deep.children.length, 1);
+  const top = asElement(child(deep, 0));
+  // Walk down iteratively to the leaf text (also proves the tree shape).
+  let node: HtmlNode = top;
+  while (node.type === "element" && node.children.length === 1) {
+    node = child(node, 0);
+  }
+  assert.equal(node.type, "text");
+  if (node.type !== "text") throw new Error("unreachable");
+  assert.equal(node.text, "leaf");
+});
+
+test("parseHtml: 5 MiB valid document parses within the input limit (stress)", () => {
+  // A single large text node keeps the node count minimal while the
+  // byte count sits at the 5 MiB boundary.
+  const filler = "x".repeat(PHASE5_LIMITS.maxHtmlBytes - 10);
+  const doc = parseHtml(`<p>${filler}</p>`);
+  const p = asElement(child(doc, 0));
+  assert.equal(asText(child(p, 0)).text.length, filler.length);
+  // Just over the limit must be rejected by the caller (runtime checks
+  // bytes before calling parseHtml); parseHtml itself is uncapped by
+  // design, so this test documents the boundary value.
+});
+
 // ---------------------------------------------------------------------------
 // selectHtml
 // ---------------------------------------------------------------------------

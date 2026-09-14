@@ -772,12 +772,16 @@ export class PluginRuntime {
       // Only engine-controlled text crosses the boundary: Phase5Error
       // messages are engine-authored, and anything unexpected is mapped
       // to a fixed safe message (host details never reach the guest).
+      // A RangeError here means the document is deeper than the sandbox
+      // value-delivery boundary (~500 levels, a QuickJS evaluator limit).
       return this.phase5Rejected(
         handle,
         error instanceof Phase5Error ? error.code : "HTML_PARSE_ERROR",
         error instanceof Phase5Error
           ? error.message
-          : "HTML parsing failed",
+          : error instanceof RangeError
+            ? "HTML structure is too deep for the sandbox (depth limit is about 500 nesting levels)"
+            : "HTML parsing failed",
         tracked,
       );
     }
@@ -805,11 +809,13 @@ export class PluginRuntime {
     let root: unknown;
     try {
       root = context.dump(docArg);
-    } catch {
+    } catch (error) {
       return this.phase5Rejected(
         handle,
         "HTML_SELECT_ERROR",
-        "document argument is not JSON-serializable",
+        error instanceof RangeError
+          ? "HTML structure is too deep to select"
+          : "document argument is not JSON-serializable",
         tracked,
       );
     }
@@ -825,7 +831,9 @@ export class PluginRuntime {
         error instanceof Phase5Error ? error.code : "HTML_SELECT_ERROR",
         error instanceof Phase5Error
           ? error.message
-          : "HTML selection failed",
+          : error instanceof RangeError
+            ? "HTML structure is too deep to select"
+            : "HTML selection failed",
         tracked,
       );
     }
@@ -848,11 +856,13 @@ export class PluginRuntime {
     let element: unknown;
     try {
       element = context.dump(elementArg);
-    } catch {
+    } catch (error) {
       return this.phase5Rejected(
         handle,
         "HTML_EXTRACT_ERROR",
-        "element argument is not JSON-serializable",
+        error instanceof RangeError
+          ? "HTML element is too deep to extract"
+          : "element argument is not JSON-serializable",
         tracked,
       );
     }
@@ -864,7 +874,9 @@ export class PluginRuntime {
         error instanceof Phase5Error ? error.code : "HTML_EXTRACT_ERROR",
         error instanceof Phase5Error
           ? error.message
-          : "HTML extraction failed",
+          : error instanceof RangeError
+            ? "HTML element is too deep to extract"
+            : "HTML extraction failed",
         tracked,
       );
     }

@@ -177,12 +177,15 @@ export function parseHtml(source: string): HtmlDocument {
       );
     }
   };
-  // Wrap the tree-building handlers with a node counter. The Parser
-  // propagates handler errors (unlike the parseDocument convenience
-  // wrapper), so the limit aborts the parse immediately.
+  // Wrap the tree-building handlers with a node counter. Every handler
+  // that creates a node counts it, so the guest-tree node count and the
+  // counted budget can never diverge. The Parser propagates handler
+  // errors (unlike the parseDocument convenience wrapper), so the limit
+  // aborts the parse immediately.
   const originalOpen = dom.onopentag.bind(dom);
   const originalText = dom.ontext.bind(dom);
   const originalComment = dom.oncomment.bind(dom);
+  const originalPi = dom.onprocessinginstruction.bind(dom);
   dom.onopentag = (name, attribs) => {
     count();
     originalOpen(name, attribs);
@@ -195,6 +198,12 @@ export function parseHtml(source: string): HtmlDocument {
     count();
     originalComment(text);
   };
+  dom.onprocessinginstruction = (name, value) => {
+    count();
+    originalPi(name, value);
+  };
+  // (CDATA never occurs in HTML mode — it parses as a comment, which the
+  // oncomment counter above already accounts for.)
 
   const parser = new Parser(dom);
   parser.write(source);
@@ -203,86 +212,117 @@ export function parseHtml(source: string): HtmlDocument {
   return domToTree(dom.root);
 }
 
-/** Convert a domhandler tree into the plain JSON tree (recursive; a
- * pathological depth surfaces as a structured error at the call site). */
-function domToTree(root: NodeWithChildren): HtmlDocument {
-  return {
-    type: "document",
-    children: root.children.map(domChildToTree),
-  };
+/**
+ * Iteratively convert domhandler child nodes into guest-tree nodes,
+ * appending them to `into`. Single implementation shared by document
+ * and element conversion. Depth is bounded only by the node budget, not
+ * by the host call stack.
+ *
+ * Notes: <script>/<style> elements carry domhandler types "script"/
+ * "style" and their contents are raw text data (never executed); CDATA
+ * content lives in its text children; processing instructions are
+ * dropped (data-only simplification for an HTML data model).
+ */
+function convertDomChildren(
+  into: HtmlNode[],
+  children: readonly ChildNode[],
+): void {
+  const pending: Array<{ into: HtmlNode[]; node: ChildNode }> = [];
+  for (let i = children.length - 1; i >= 0; i--) {
+    pending.push({ into, node: children[i]! });
+  }
+  while (pending.length > 0) {
+    const { into: target, node } = pending.pop()!;
+    if (node.type === "tag" || node.type === "script" || node.type === "style") {
+      const el: HtmlElement = {
+        type: "element",
+        tagName: node.name,
+        attributes: { ...node.attribs },
+        children: [],
+      };
+      target.push(el);
+      const kids = node.children;
+      for (let i = kids.length - 1; i >= 0; i--) {
+        pending.push({ into: el.children, node: kids[i]! });
+      }
+    } else if (node.type === "cdata") {
+      let text = "";
+      for (const c of node.children) {
+        if (c.type === "text") text += c.data;
+      }
+      target.push({ type: "text", text });
+    } else if (node.type === "text") {
+      target.push({ type: "text", text: node.data });
+    } else if (node.type === "comment") {
+      target.push({ type: "comment", text: node.data });
+    } else {
+      target.push({ type: "text", text: "" });
+    }
+  }
 }
 
-function domChildToTree(node: ChildNode): HtmlNode {
-  // Note: <script> and <style> elements carry the domhandler node types
-  // "script"/"style" (not "tag"); their contents are raw text data,
-  // never executed.
-  if (node.type === "tag" || node.type === "script" || node.type === "style") {
-    return {
-      type: "element",
-      tagName: node.name,
-      attributes: { ...node.attribs },
-      children: node.children.map(domChildToTree),
-    };
-  }
-  if (node.type === "text") {
-    return { type: "text", text: node.data };
-  }
-  if (node.type === "comment") {
-    return { type: "comment", text: node.data };
-  }
-  if (node.type === "cdata") {
-    // CDATA is a parent node whose content lives in text children.
-    return {
-      type: "text",
-      text: node.children
-        .filter((c) => c.type === "text")
-        .map((c) => c.data)
-        .join(""),
-    };
-  }
-  // Processing instructions are dropped (not represented in the guest
-  // tree; data-only simplification for an HTML data model).
-  return { type: "text", text: "" };
+function domToTree(root: NodeWithChildren): HtmlDocument {
+  const doc: HtmlDocument = { type: "document", children: [] };
+  convertDomChildren(doc.children, root.children);
+  return doc;
+}
+
+function domElementToTree(el: DomElement): HtmlElement {
+  const out: HtmlElement = {
+    type: "element",
+    tagName: el.name,
+    attributes: { ...el.attribs },
+    children: [],
+  };
+  convertDomChildren(out.children, el.children);
+  return out;
 }
 
 // ---------------------------------------------------------------------------
 // Validation of guest-supplied trees (select/extract arguments)
 // ---------------------------------------------------------------------------
 
-function validateNode(node: unknown): asserts node is HtmlNode {
-  if (typeof node !== "object" || node === null) {
-    throw new Phase5Error("HTML_SELECT_ERROR", "invalid element structure");
-  }
-  const n = node as Record<string, unknown>;
-  if (n.type === "text" || n.type === "comment") {
-    if (typeof n.text !== "string") {
+function validateNodeTree(root: unknown): asserts root is HtmlNode {
+  // ITERATIVE (explicit stack): guest-supplied trees can be as deep as
+  // the parser's node budget; recursion would overflow the stack first.
+  const stack: unknown[] = [root];
+  while (stack.length > 0) {
+    const node = stack.pop()!;
+    if (typeof node !== "object" || node === null) {
       throw new Phase5Error("HTML_SELECT_ERROR", "invalid element structure");
     }
-    return;
-  }
-  if (n.type !== "element") {
-    throw new Phase5Error("HTML_SELECT_ERROR", "invalid element structure");
-  }
-  if (typeof n.tagName !== "string" || n.tagName.length === 0) {
-    throw new Phase5Error("HTML_SELECT_ERROR", "invalid element structure");
-  }
-  if (typeof n.attributes !== "object" || n.attributes === null) {
-    throw new Phase5Error("HTML_SELECT_ERROR", "invalid element structure");
-  }
-  const attrs = n.attributes as Record<string, unknown>;
-  if (Object.keys(attrs).length > 1024) {
-    throw new Phase5Error("HTML_SELECT_ERROR", "invalid element structure");
-  }
-  for (const value of Object.values(attrs)) {
-    if (typeof value !== "string") {
+    const n = node as Record<string, unknown>;
+    if (n.type === "text" || n.type === "comment") {
+      if (typeof n.text !== "string") {
+        throw new Phase5Error("HTML_SELECT_ERROR", "invalid element structure");
+      }
+      continue;
+    }
+    if (n.type !== "element") {
       throw new Phase5Error("HTML_SELECT_ERROR", "invalid element structure");
     }
-  }
-  if (!Array.isArray(n.children)) {
-    throw new Phase5Error("HTML_SELECT_ERROR", "invalid element structure");
-  }
-  for (const child of n.children as unknown[]) {
-    validateNode(child);
+    if (typeof n.tagName !== "string" || n.tagName.length === 0) {
+      throw new Phase5Error("HTML_SELECT_ERROR", "invalid element structure");
+    }
+    if (typeof n.attributes !== "object" || n.attributes === null) {
+      throw new Phase5Error("HTML_SELECT_ERROR", "invalid element structure");
+    }
+    const attrs = n.attributes as Record<string, unknown>;
+    if (Object.keys(attrs).length > 1024) {
+      throw new Phase5Error("HTML_SELECT_ERROR", "invalid element structure");
+    }
+    for (const value of Object.values(attrs)) {
+      if (typeof value !== "string") {
+        throw new Phase5Error("HTML_SELECT_ERROR", "invalid element structure");
+      }
+    }
+    if (!Array.isArray(n.children)) {
+      throw new Phase5Error("HTML_SELECT_ERROR", "invalid element structure");
+    }
+    const children = n.children as unknown[];
+    for (let i = children.length - 1; i >= 0; i--) {
+      stack.push(children[i]);
+    }
   }
 }
 
@@ -302,11 +342,11 @@ function validateDocumentOrElement(root: unknown): HtmlDocument | HtmlElement {
       );
     }
     for (const child of r.children as unknown[]) {
-      validateNode(child);
+      validateNodeTree(child);
     }
     return root as HtmlDocument;
   }
-  validateNode(root);
+  validateNodeTree(root);
   return root as HtmlElement;
 }
 
@@ -331,23 +371,51 @@ function wireChildren(parent: ParentNode): void {
   }
 }
 
-/**
- * Rebuild a domhandler node from a (validated) JSON tree node so the
- * mature css-select engine can run on it.
- */
-function domFromJson(node: HtmlNode): ChildNode {
+function makeDomNode(node: HtmlNode): ChildNode {
   if (node.type === "text") {
     return new DomText(node.text);
   }
   if (node.type === "comment") {
     return new DomComment(node.text);
   }
-  const el = new DomElement(node.tagName, { ...node.attributes });
-  for (const child of node.children) {
-    el.children.push(domFromJson(child));
+  return new DomElement(node.tagName, { ...node.attributes });
+}
+
+/**
+ * Rebuild a domhandler tree from a (validated) JSON tree so the mature
+ * css-select engine can run on it.
+ *
+ * ITERATIVE (explicit stack): guest-supplied trees can be as deep as the
+ * parser's node budget; recursion would overflow the stack first.
+ */
+function domFromJson(rootNode: HtmlNode): ChildNode {
+  const root = makeDomNode(rootNode);
+  if (rootNode.type !== "element") {
+    return root;
   }
-  wireChildren(el);
-  return el;
+  const rootParent = root as DomElement;
+  const parents: ParentNode[] = [rootParent];
+  const pending: Array<{ parent: DomElement; child: HtmlNode }> = [];
+  for (let i = rootNode.children.length - 1; i >= 0; i--) {
+    pending.push({ parent: rootParent, child: rootNode.children[i]! });
+  }
+  while (pending.length > 0) {
+    const { parent, child } = pending.pop()!;
+    const domChild = makeDomNode(child);
+    parent.children.push(domChild);
+    if (child.type === "element") {
+      const el = domChild as DomElement;
+      parents.push(el);
+      for (let i = child.children.length - 1; i >= 0; i--) {
+        pending.push({ parent: el, child: child.children[i]! });
+      }
+    }
+  }
+  // Every parent is wired independently, so creation order is irrelevant.
+  for (const parent of parents) {
+    wireChildren(parent);
+  }
+  return root;
 }
 
 function toInfoDom(el: DomElement): HtmlElementInfo {
@@ -375,18 +443,6 @@ function toInfoDom(el: DomElement): HtmlElementInfo {
 
 function normalizeWhitespace(text: string): string {
   return text.replace(/\s+/g, " ").trim();
-}
-
-/**
- * Convert one matched domhandler element back into a guest-tree node.
- */
-function matchedToElement(el: DomElement): HtmlElement {
-  return {
-    type: "element",
-    tagName: el.name,
-    attributes: { ...el.attribs },
-    children: el.children.map(domChildToTree),
-  };
 }
 
 /**
@@ -434,7 +490,7 @@ export function selectHtml(root: unknown, selector: string): HtmlElement[] {
       `Selector matched ${matches.length} elements; the maximum is ${PHASE5_LIMITS.maxSelectResults}`,
     );
   }
-  return matches.map(matchedToElement);
+  return matches.map(domElementToTree);
 }
 
 // ---------------------------------------------------------------------------
@@ -458,7 +514,7 @@ export function extractHtml(element: unknown): HtmlElementInfo {
       "html.extract() requires an element (not a document or text node)",
     );
   }
-  validateNode(element);
+  validateNodeTree(element);
   return toInfoDom(domFromJson(element as HtmlElement) as DomElement);
 }
 
