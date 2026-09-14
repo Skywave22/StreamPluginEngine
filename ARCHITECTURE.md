@@ -1,23 +1,26 @@
 # Architecture (planned)
 
 Status: the layering below is the overall design. **Phases 1 (foundation),
-2 (plugin manifest + loader), 3 (sandboxed plugin runtime), and 4
-(engine-controlled HTTP) are implemented; everything else is still planned
-and not implemented.**
+2 (plugin manifest + loader), 3 (sandboxed plugin runtime), 4
+(engine-controlled HTTP), 5 (HTML + JSON parsing capabilities), and 6
+(normalized source result pipeline) are implemented; everything else is
+still planned and not implemented.**
 
 ## Layering
 
 ```
 Application
     ↓
-Plugin Engine
+Plugin Engine          (implemented: normalized source result
+                       pipeline — raw → validated → normalized)
     ↓
 Plugin Runtime
     ↓
-Plugin API            (implemented: manifest, log, http)
+Plugin API            (implemented: manifest, log, http, json, html)
     ↓
 HTTP / HTML / JSON capabilities
-                      (implemented: HTTP + JSON response helper)
+                      (implemented: HTTP, HTML parsing + selection,
+                       JSON parsing + serialization)
     ↓
 External websites
 ```
@@ -191,6 +194,141 @@ stream/M3U8/media extraction, provider-specific logic, and any
 CAPTCHA/Cloudflare/DRM/proxy/auth-bypass capability. The engine performs
 plain HTTP only.
 
+### Phase 5 — HTML + JSON parsing capabilities
+
+Parser-only data capabilities layered on top of Phase 4. Plugins can now
+turn HTTP responses into structured data; the engine — not the plugin —
+owns all parsing.
+
+- **`context.json` (guest-side).** A small static engine-authored source
+  (`PHASE5_JSON_GUEST_SOURCE` in `src/phase5.ts`) is evaluated into the
+  guest once per operation. It wraps the guest's native JSON, so no value
+  crosses the Wasm boundary for JSON work: `parse(text)` never evaluates
+  code, and `stringify(value)` reports circular structures as a structured
+  `JSON_STRINGIFY_ERROR` instead of silently dropping data. Both functions
+  are synchronous and throw structured `{ code, message }` objects
+  (`JSON_INVALID_INPUT`, `JSON_INPUT_TOO_LARGE`, `JSON_INVALID`,
+  `JSON_STRINGIFY_ERROR`, `JSON_OUTPUT_TOO_LARGE`).
+- **`context.html` (host-bridged).** `parse` / `select` / `extract` are
+  host functions: the guest's document/element tree (plain JSON) crosses
+  the boundary via the runtime's dump, the work happens host-side, and the
+  result (plain JSON) crosses back. On success the value is returned
+  synchronously; on failure the guest receives a **rejected promise**
+  carrying a structured `{ code, message }` object (the same error path
+  HTTP failures use). Unexpected host exceptions are mapped to fixed safe
+  messages — host details never reach the guest.
+- **Parser stack.** HTML parsing uses the mature, lightweight
+  **htmlparser2** parser (permissive, browser-like error recovery),
+  **css-select** for selector matching, and **dom-serializer** for
+  `innerHTML`/`outerHTML` — the same parser core cheerio is built on. The
+  earlier hand-rolled parser prototype was replaced because it could not
+  reliably handle all HTML edge cases (e.g. `>` inside quoted attribute
+  values, raw-text elements). The selected packages are small, pure
+  JavaScript, self-typed, and widely maintained; adding them was an
+  explicit exception to the minimal-dependency rule, justified by
+  correctness.
+- **Document model.** `parse` returns a JSON-serializable tree:
+  `{ type: "document", children: [...] }` with `element`
+  (`tagName`, `attributes`, `children`), `text`, and `comment` nodes.
+  `<script>`/`<style>` contents become plain text data (never executed);
+  `select` returns matched element nodes; `extract` returns the info
+  object (`tagName`, normalized `text`, `attributes`, `href`, `src`,
+  `class`, `id`, `data` (data-* without prefix), `innerHTML`,
+  `outerHTML`).
+- **Limits.** `PHASE5_LIMITS`: 5 MiB HTML input (UTF-8), 5 MiB JSON input
+  and output, 50,000 parsed nodes, and 1,000 `select` results. Node
+  counting happens *during* parsing (counting handlers on the parser), so
+  a pathological document aborts at the limit instead of being fully
+  materialized. `select` rebuilds the tree, wires ancestor/sibling
+  pointers, and runs css-select on it — the matching work is bounded and
+  does not run guest code.
+- **Security.** Parsing is data-only: no JavaScript execution, no event
+  handlers, no resource loading, no following of `href`/`src`, no
+  filesystem or environment access. `javascript:` URLs and `on*` handler
+  attributes survive only as inert strings. The network surface remains
+  exclusively `context.http`. All limits are engine constants that
+  plugins cannot raise.
+
+**Deliberate non-provisions (Phase 5)** — intentionally NOT implemented,
+by design: media/stream (M3U8/MP4) extraction, playback, DRM/CAPTCHA/
+Cloudflare/auth bypass, browser automation, in-page JavaScript execution,
+DOM mutation, and any fetching of parsed URLs.
+
+### Phase 6 — Normalized source result pipeline
+
+Plugins can now return structured **source results** to the future
+application through a validated, normalized pipeline. The architectural
+decision: **the plugin produces raw structured data; the engine produces
+trusted normalized data.** The guest never performs validation or
+normalization itself, and the application never consumes raw plugin
+output directly.
+
+Result flow:
+
+```
+External website
+    ↓
+context.http (Phase 4)
+    ↓
+context.html / context.json (Phase 5)
+    ↓
+Plugin logic (QuickJS sandbox) — transforms extracted data
+    ↓
+RAW source results (unknown — untrusted plain data;
+execute() returns it untouched — Phase 1–5 behavior preserved)
+    ↓
+normalizeSourceResults(raw)  (host, src/results.ts)
+    ↓  extract raw list → validate item (typed fields, required checks,
+       URL policy) → normalize (trim, canonical URLs, safe metadata)
+Normalized SourceResult[]  (trusted, JSON-serializable)
+    ↓
+Future application
+```
+
+- **Result model** (`src/results.ts`) — `SourceResult`: required
+  `id`, `title`, `type` (closed enum: `movie`, `episode`, `series`,
+  `search`, `source`), `url`; optional `source`, `thumbnail`, `quality`,
+  `language`, `subtitles` (`{ url, language?, format? }`), and a flat
+  scalar `metadata` map (always present; empty when absent). The model
+  is strictly typed (no `any`; raw input is `unknown`), extensible
+  without breaking, and deliberately free of media/DRM/stream concerns.
+- **Three data stages** — raw plugin output (`unknown`), validated
+  results (typed intermediate with parsed URLs), and normalized
+  `SourceResult` (canonical strings/URLs, safe metadata). The public
+  entry point is one function: `normalizeSourceResults(raw)` returning
+  `{ ok: true, results } | { ok: false, error: { code, message } }`.
+- **Validation policy** — all-or-nothing: an invalid required field or a
+  size violation rejects the whole input with a structured error that
+  names the item and field (`result[3]: field 'url': ...`). Invalid
+  OPTIONAL values are dropped instead of being fatal (e.g. a malformed
+  thumbnail URL). Duplicate `id`s keep the first occurrence.
+- **URL policy** — `url`, `thumbnail`, and subtitle URLs must be
+  absolute `http:`/`https:` URLs; other protocols (`javascript:`,
+  `file:`, `data:`, `ftp:`, …) and relative URLs are rejected/dropped.
+  Result URLs are **never fetched or verified** — they are data.
+- **Limits** (`RESULT_LIMITS`) — 1,000 results; field length caps
+  (`id` 200, `title` 500, URL 2,048, `source` 200, `quality` 50,
+  `language` 20, subtitle `format` 30); 50 subtitles per result;
+  metadata: 64 keys, 100-char keys, 500-char string values, 8 KiB
+  serialized. Explicit engine constants; plugins cannot raise them.
+- **Security** — every field is strictly type-checked (functions,
+  Dates, nested objects, NaN/Infinity, and null are rejected); metadata
+  keys `__proto__`, `constructor`, and `prototype` are rejected
+  (prototype-pollution protection) and metadata is rebuilt as a fresh
+  plain object; the input is never mutated; unexpected internal errors
+  map to a fixed safe message. The pipeline is pure host logic — no
+  network, no filesystem, no QuickJS.
+- **Plugin contract** — unchanged and simple: the capability returns a
+  result object or an array of them (plain JSON-serializable data).
+  `execute()` semantics are untouched; normalization happens at the
+  engine/app boundary, keeping Phases 1–5 behavior fully backward
+  compatible.
+
+**Deliberate non-provisions (Phase 6)** — intentionally NOT implemented,
+by design: media/stream extraction, downloading, playback, DRM/CAPTCHA/
+Cloudflare/auth bypass, browser automation, fetching or verifying result
+URLs, result caching, and automatic crawling.
+
 ## Planned plugin entry-point types (not implemented)
 
 - Search
@@ -201,14 +339,16 @@ plain HTTP only.
 ## Planned engine features (not implemented)
 
 - Plugin enable/disable (the manager only has registry-level unregister)
-- HTML parsing (capability)
 - Parallel plugin execution with per-plugin timeouts
 - Testing and benchmarking hooks
 
 (Implemented so far: manifest schema + validation, discovery, loading,
 manager, sandboxed JavaScript execution, controlled context, per-operation
-timeouts, memory limits, error isolation at the load/execute level, and
-engine-controlled HTTP with limits, structured errors, and cancellation.)
+timeouts, memory limits, error isolation at the load/execute level,
+engine-controlled HTTP with limits, structured errors, and cancellation,
+HTML + JSON parsing capabilities with engine-enforced limits and
+structured errors, and the normalized source result pipeline with
+central validation, normalization, and explicit limits.)
 
 ## Design constraints
 
@@ -233,4 +373,13 @@ engine-controlled HTTP with limits, structured errors, and cancellation.)
   redirect re-validation, cancellation on operation end. *(complete — HTTP
   only; HTML parsing, enable/disable, standard entry points, and parallel
   execution are deliberately deferred to later phases.)*
-- **Phase 5** — Testing and benchmarking tooling.
+- **Phase 5** — HTML + JSON parsing capabilities: `context.json`
+  (parse/stringify, bounded, guest-side) and `context.html`
+  (parse/select/extract on htmlparser2 + css-select, bounded, data-only),
+  structured error model, engine-enforced size/node/result limits.
+  *(complete)*
+- **Phase 6** — Normalized source-result pipeline: `SourceResult` model,
+  `normalizeSourceResults()` (raw → validated → normalized), http/https
+  URL policy, explicit limits, prototype-pollution-safe metadata,
+  structured errors. *(complete)*
+- **Phase 7** — Testing and benchmarking tooling.

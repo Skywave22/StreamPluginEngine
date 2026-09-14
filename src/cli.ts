@@ -8,7 +8,6 @@
 import path from "node:path";
 import process from "node:process";
 
-import "./phase5.js";
 import { PluginManager } from "./manager.js";
 import { PluginRuntime } from "./runtime.js";
 

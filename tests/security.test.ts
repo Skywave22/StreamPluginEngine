@@ -97,9 +97,10 @@ test("host globals are unavailable inside the sandbox", async (t) => {
   }
 });
 
-test("the plugin context surface is exactly http + log + manifest (Phase 4)", async (t) => {
-  // Phase 4 adds context.http to the Phase 3 surface (manifest + log).
-  // The surface must stay exactly this controlled set — no host objects.
+test("the plugin context surface is exactly http + json + html + log + manifest (Phase 5)", async (t) => {
+  // Phase 5 adds context.json and context.html to the Phase 4 surface
+  // (manifest + log + http). The surface must stay exactly this
+  // controlled set — no host objects.
   const base = await makeTempDir(t);
   const plugin = await writePlugin(
     base,
@@ -110,11 +111,11 @@ test("the plugin context surface is exactly http + log + manifest (Phase 4)", as
           .sort()
           .map((k) => {
             let kind = typeof context[k];
-            if (k === "http") {
-              kind =
-                typeof context.http === "object" && context.http !== null
-                  ? "http(" + Object.keys(context.http).sort().join(",") + ")"
-                  : kind;
+            if (k === "http" || k === "json" || k === "html") {
+              const obj = context[k];
+              if (typeof obj === "object" && obj !== null) {
+                kind = k + "(" + Object.keys(obj).sort().join(",") + ")";
+              }
             }
             return k + ":" + kind;
           }),
@@ -130,7 +131,9 @@ test("the plugin context surface is exactly http + log + manifest (Phase 4)", as
   assert.ok(result.success);
   if (result.success) {
     assert.deepEqual(result.value, [
+      "html:html(extract,parse,select)",
       "http:http(get,getJson,request)",
+      "json:json(parse,stringify)",
       "log:function",
       "manifest:object",
     ]);

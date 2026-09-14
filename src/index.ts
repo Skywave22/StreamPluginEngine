@@ -9,10 +9,6 @@
  * See ARCHITECTURE.md for the planned design and README.md for status.
  */
 
-// Phase 5 capabilities are installed as a runtime extension. This side-effect
-// import makes the complete Phase 5 context available to public consumers.
-import "./phase5.js";
-
 export const ENGINE_NAME = "stream-plugin-engine";
 export const ENGINE_VERSION = "0.1.0";
 export const ENGINE_PHASE = 5 as const;
@@ -21,7 +17,6 @@ export { validateManifest } from "./manifest.js";
 export { MANIFEST_FILE_NAME, PluginLoader } from "./loader.js";
 export { PluginManager } from "./manager.js";
 export { PluginRuntime } from "./runtime.js";
-export { installPhase5Capabilities } from "./phase5.js";
 
 export {
   DEFAULT_HTTP_LIMITS,
@@ -40,6 +35,42 @@ export type {
   HttpResponse,
 } from "./http.js";
 
+export {
+  PHASE5_LIMITS,
+  PHASE5_ERROR_CODES,
+  Phase5Error,
+  parseHtml,
+  selectHtml,
+  extractHtml,
+} from "./phase5.js";
+
+export type {
+  Phase5ErrorCode,
+  Phase5ErrorObject,
+  HtmlDocument,
+  HtmlNode,
+  HtmlElement,
+  HtmlElementInfo,
+} from "./phase5.js";
+
+export type { PluginJson, PluginHtml } from "./phase5-types.js";
+
+export {
+  RESULT_LIMITS,
+  RESULT_ERROR_CODES,
+  SOURCE_RESULT_TYPES,
+  normalizeSourceResults,
+} from "./results.js";
+
+export type {
+  ResultErrorCode,
+  ResultErrorObject,
+  SourceResult,
+  SourceResultType,
+  SourceResultValidationResult,
+  SourceSubtitle,
+} from "./results.js";
+
 export type {
   KnownCapability,
   ManifestValidationResult,
@@ -55,6 +86,5 @@ export type {
   PluginStatus,
 } from "./types.js";
 
-export type { PluginJson, PluginHtml } from "./phase5-types.js";
 export { KNOWN_CAPABILITIES } from "./types.js";
 export type { LoadedPlugin } from "./types.js";

@@ -1,34 +1,137 @@
 /**
- * Phase 5: JSON + HTML parsing capabilities.
+ * Phase 5: JSON + HTML parsing capabilities (host-side module).
  *
- * Data-only parsing. This module never executes HTML/JavaScript, follows
- * URLs, touches the filesystem, or performs network requests.
+ * This module is pure host logic: it never touches QuickJS, never
+ * executes HTML/JavaScript, never follows URLs, never touches the
+ * filesystem, and performs no network requests. The PluginRuntime wires
+ * its functions into the controlled context (see src/runtime.ts):
+ *
+ * - `context.json` is installed as a small static guest-side source
+ *   (PHASE5_JSON_GUEST_SOURCE) that wraps the guest's native JSON. No
+ *   value crosses the Wasm boundary for JSON work, so there is no host
+ *   round-trip and no host object can enter the guest through it.
+ * - `context.html` is implemented host-side on top of the mature,
+ *   lightweight htmlparser2 + css-select + dom-serializer packages
+ *   (the same parser core cheerio is built on). Parsing is data-only:
+ *   <script> and <style> contents become plain text nodes, nothing is
+ *   executed, and no linked resource is ever fetched.
  *
  * Network access remains exclusively context.http from Phase 4.
+ *
+ * Guest-facing error contract (structured `{ code, message }` objects,
+ * never host stack traces):
+ * - context.json.parse / context.json.stringify are SYNCHRONOUS and
+ *   THROW a structured error object on failure.
+ * - context.html.parse / select / extract are SYNCHRONOUS on success
+ *   (they return the value directly) and return a REJECTED PROMISE
+ *   carrying a structured error object on failure.
  */
-import type { QuickJSContext, QuickJSHandle } from "quickjs-emscripten";
-import { PluginRuntime } from "./runtime.js";
+import { DomHandler, Parser } from "htmlparser2";
+import {
+  Comment as DomComment,
+  Document as DomDocument,
+  Element as DomElement,
+  Text as DomText,
+} from "domhandler";
+import type { ChildNode, NodeWithChildren, ParentNode } from "domhandler";
+import { getText } from "domutils";
+import { render as serializeNode } from "dom-serializer";
+import { selectAll } from "css-select";
 
-const MAX_HTML_BYTES = 5 * 1024 * 1024;
-const MAX_JSON_BYTES = 5 * 1024 * 1024;
-const MAX_HTML_NODES = 50_000;
+// ---------------------------------------------------------------------------
+// Limits
+// ---------------------------------------------------------------------------
 
-type Disposable = { alive: boolean; dispose(): void };
-type ContextBuilder = (
-  this: PluginRuntime,
-  context: QuickJSContext,
-  handle: unknown,
-  tracked: Disposable[],
-  opAbort: AbortController,
-) => QuickJSHandle;
+/**
+ * Engine-controlled hard limits. Plugins cannot raise them: inputs are
+ * bounded before parsing, node counts are bounded during parsing, and
+ * selector result counts are bounded before serialization.
+ */
+export const PHASE5_LIMITS = {
+  /** Maximum UTF-8 byte length of an HTML string passed to html.parse. */
+  maxHtmlBytes: 5 * 1024 * 1024,
+  /** Maximum length (in UTF-16 units) of JSON text / serialized output. */
+  maxJsonBytes: 5 * 1024 * 1024,
+  /** Maximum total node count (elements + text + comments) for one document. */
+  maxHtmlNodes: 50_000,
+  /** Maximum number of elements returned by one html.select call. */
+  maxSelectResults: 1_000,
+} as const;
+
+// ---------------------------------------------------------------------------
+// Structured errors
+// ---------------------------------------------------------------------------
+
+/** Structured error codes produced by the Phase 5 capabilities. */
+export const PHASE5_ERROR_CODES = [
+  /** Argument of the wrong type (e.g. parse received a non-string). */
+  "JSON_INVALID_INPUT",
+  /** JSON input exceeds PHASE5_LIMITS.maxJsonBytes. */
+  "JSON_INPUT_TOO_LARGE",
+  /** The input text is not valid JSON. */
+  "JSON_INVALID",
+  /** JSON output exceeds PHASE5_LIMITS.maxJsonBytes. */
+  "JSON_OUTPUT_TOO_LARGE",
+  /** The value is not JSON-serializable (circular structure, top-level
+   * undefined or function). */
+  "JSON_STRINGIFY_ERROR",
+  /** Argument of the wrong type for an html.* call. */
+  "HTML_INVALID_INPUT",
+  /** HTML input exceeds PHASE5_LIMITS.maxHtmlBytes. */
+  "HTML_INPUT_TOO_LARGE",
+  /** The HTML could not be parsed (malformed beyond tolerance, node
+   * limit exceeded, structure too deep). */
+  "HTML_PARSE_ERROR",
+  /** The selector argument is missing or empty. */
+  "HTML_INVALID_SELECTOR",
+  /** The selector is invalid, or the document argument is not a parsed
+   * document/element. */
+  "HTML_SELECT_ERROR",
+  /** The extract() argument is missing. */
+  "HTML_INVALID_ELEMENT",
+  /** The extract() argument is not a parsed element, or extraction
+   * failed. */
+  "HTML_EXTRACT_ERROR",
+  /** A selector matched more than PHASE5_LIMITS.maxSelectResults elements. */
+  "HTML_TOO_MANY_RESULTS",
+] as const;
+
+export type Phase5ErrorCode = (typeof PHASE5_ERROR_CODES)[number];
+
+/** The structured error shape plugins see (thrown or in a rejection). */
+export interface Phase5ErrorObject {
+  code: Phase5ErrorCode;
+  message: string;
+}
+
+/** Internal host-side error carrying a Phase 5 code. */
+export class Phase5Error extends Error {
+  constructor(
+    readonly code: Phase5ErrorCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = "Phase5Error";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Document tree shape (guest-visible; JSON-serializable)
+// ---------------------------------------------------------------------------
 
 export interface HtmlDocument {
   type: "document";
   children: HtmlNode[];
 }
 export type HtmlNode = HtmlElement | HtmlText | HtmlComment;
-export interface HtmlText { type: "text"; text: string }
-export interface HtmlComment { type: "comment"; text: string }
+export interface HtmlText {
+  type: "text";
+  text: string;
+}
+export interface HtmlComment {
+  type: "comment";
+  text: string;
+}
 export interface HtmlElement {
   type: "element";
   tagName: string;
@@ -37,539 +140,413 @@ export interface HtmlElement {
 }
 export interface HtmlElementInfo {
   tagName: string;
+  /** Normalized (whitespace-collapsed, trimmed) descendant text. */
   text: string;
   attributes: Record<string, string>;
   href?: string;
   src?: string;
   class?: string;
   id?: string;
+  /** `data-*` attributes without the `data-` prefix. */
   data: Record<string, string>;
   innerHTML: string;
   outerHTML: string;
 }
 
-let installed = false;
+// ---------------------------------------------------------------------------
+// HTML parsing (htmlparser2, with bounded node counting)
+// ---------------------------------------------------------------------------
 
-/** Install Phase 5 capabilities once for this process. */
-export function installPhase5Capabilities(): void {
-  if (installed) return;
+/**
+ * Parse an HTML string into the guest-visible tree.
+ *
+ * Uses htmlparser2 (mature, permissive, browser-like error recovery).
+ * The node count is bounded DURING parsing via the counting handlers:
+ * a pathological document aborts as soon as the limit is exceeded
+ * instead of being fully materialized.
+ */
+export function parseHtml(source: string): HtmlDocument {
+  const dom = new DomHandler();
+  let nodes = 1; // the document root
+  const count = (): void => {
+    nodes += 1;
+    if (nodes > PHASE5_LIMITS.maxHtmlNodes) {
+      throw new Phase5Error(
+        "HTML_PARSE_ERROR",
+        `HTML node limit exceeded (${PHASE5_LIMITS.maxHtmlNodes})`,
+      );
+    }
+  };
+  // Wrap the tree-building handlers with a node counter. The Parser
+  // propagates handler errors (unlike the parseDocument convenience
+  // wrapper), so the limit aborts the parse immediately.
+  const originalOpen = dom.onopentag.bind(dom);
+  const originalText = dom.ontext.bind(dom);
+  const originalComment = dom.oncomment.bind(dom);
+  dom.onopentag = (name, attribs) => {
+    count();
+    originalOpen(name, attribs);
+  };
+  dom.ontext = (text) => {
+    count();
+    originalText(text);
+  };
+  dom.oncomment = (text) => {
+    count();
+    originalComment(text);
+  };
 
-  const prototype = PluginRuntime.prototype as unknown as Record<string, unknown>;
-  const original = prototype["buildPluginContext"];
-  if (typeof original !== "function") {
-    throw new Error("Phase 5: PluginRuntime context builder not found");
-  }
+  const parser = new Parser(dom);
+  parser.write(source);
+  parser.end();
 
-  const build = original as ContextBuilder;
-  prototype["buildPluginContext"] = function (
-    context: QuickJSContext,
-    handle: unknown,
-    tracked: Disposable[],
-    opAbort: AbortController,
-  ): QuickJSHandle {
-    const contextObject = build.call(this, context, handle, tracked, opAbort);
+  return domToTree(dom.root);
+}
 
-    const jsonObject = track(context.newObject(), tracked);
-
-    const jsonParse = track(
-      context.newFunction("parse", (arg?: QuickJSHandle) => {
-        if (!arg || context.typeof(arg) !== "string") {
-          return rejected(
-            context,
-            "JSON_INVALID_INPUT",
-            "json.parse() requires a string",
-          );
-        }
-        const text = context.getString(arg);
-        if (utf8Length(text) > MAX_JSON_BYTES) {
-          return rejected(
-            context,
-            "JSON_INPUT_TOO_LARGE",
-            "JSON input exceeds 5 MiB",
-          );
-        }
-        try {
-          return jsonLiteral(context, JSON.parse(text));
-        } catch (error) {
-          return rejected(context, "JSON_INVALID", errorMessage(error));
-        }
-      }),
-      tracked,
-    );
-
-    const jsonStringify = track(
-      context.newFunction("stringify", (arg?: QuickJSHandle) => {
-        try {
-          const value = arg ? context.dump(arg) : undefined;
-          const text = JSON.stringify(value);
-          if (text === undefined) return context.newString("undefined");
-          if (utf8Length(text) > MAX_JSON_BYTES) {
-            return rejected(
-              context,
-              "JSON_OUTPUT_TOO_LARGE",
-              "JSON output exceeds 5 MiB",
-            );
-          }
-          return context.newString(text);
-        } catch (error) {
-          return rejected(
-            context,
-            "JSON_STRINGIFY_ERROR",
-            errorMessage(error),
-          );
-        }
-      }),
-      tracked,
-    );
-
-    context.setProp(jsonObject, "parse", jsonParse);
-    context.setProp(jsonObject, "stringify", jsonStringify);
-
-    const htmlObject = track(context.newObject(), tracked);
-
-    const htmlParse = track(
-      context.newFunction("parse", (arg?: QuickJSHandle) => {
-        if (!arg || context.typeof(arg) !== "string") {
-          return rejected(
-            context,
-            "HTML_INVALID_INPUT",
-            "html.parse() requires a string",
-          );
-        }
-        const html = context.getString(arg);
-        if (utf8Length(html) > MAX_HTML_BYTES) {
-          return rejected(
-            context,
-            "HTML_INPUT_TOO_LARGE",
-            "HTML input exceeds 5 MiB",
-          );
-        }
-        try {
-          return jsonLiteral(context, parseHtml(html));
-        } catch (error) {
-          return rejected(context, "HTML_PARSE_ERROR", errorMessage(error));
-        }
-      }),
-      tracked,
-    );
-
-    const htmlSelect = track(
-      context.newFunction(
-        "select",
-        (docArg?: QuickJSHandle, selectorArg?: QuickJSHandle) => {
-          if (
-            !docArg ||
-            !selectorArg ||
-            context.typeof(selectorArg) !== "string"
-          ) {
-            return rejected(
-              context,
-              "HTML_INVALID_SELECTOR",
-              "html.select(document, selector) requires a selector string",
-            );
-          }
-          try {
-            const root = context.dump(docArg) as HtmlDocument | HtmlElement;
-            const selector = context.getString(selectorArg);
-            return jsonLiteral(
-              context,
-              selectHtml(root, selector).map(toInfo),
-            );
-          } catch (error) {
-            return rejected(context, "HTML_SELECT_ERROR", errorMessage(error));
-          }
-        },
-      ),
-      tracked,
-    );
-
-    const htmlExtract = track(
-      context.newFunction("extract", (elementArg?: QuickJSHandle) => {
-        if (!elementArg) {
-          return rejected(
-            context,
-            "HTML_INVALID_ELEMENT",
-            "html.extract() requires an element",
-          );
-        }
-        try {
-          return jsonLiteral(
-            context,
-            toInfo(context.dump(elementArg) as HtmlElement),
-          );
-        } catch (error) {
-          return rejected(context, "HTML_EXTRACT_ERROR", errorMessage(error));
-        }
-      }),
-      tracked,
-    );
-
-    context.setProp(htmlObject, "parse", htmlParse);
-    context.setProp(htmlObject, "select", htmlSelect);
-    context.setProp(htmlObject, "extract", htmlExtract);
-    context.setProp(contextObject, "json", jsonObject);
-    context.setProp(contextObject, "html", htmlObject);
-
-    installed = true;
-    return contextObject;
+/** Convert a domhandler tree into the plain JSON tree (recursive; a
+ * pathological depth surfaces as a structured error at the call site). */
+function domToTree(root: NodeWithChildren): HtmlDocument {
+  return {
+    type: "document",
+    children: root.children.map(domChildToTree),
   };
 }
 
-function track<T extends Disposable>(value: T, list: Disposable[]): T {
-  list.push(value);
-  return value;
+function domChildToTree(node: ChildNode): HtmlNode {
+  // Note: <script> and <style> elements carry the domhandler node types
+  // "script"/"style" (not "tag"); their contents are raw text data,
+  // never executed.
+  if (node.type === "tag" || node.type === "script" || node.type === "style") {
+    return {
+      type: "element",
+      tagName: node.name,
+      attributes: { ...node.attribs },
+      children: node.children.map(domChildToTree),
+    };
+  }
+  if (node.type === "text") {
+    return { type: "text", text: node.data };
+  }
+  if (node.type === "comment") {
+    return { type: "comment", text: node.data };
+  }
+  if (node.type === "cdata") {
+    // CDATA is a parent node whose content lives in text children.
+    return {
+      type: "text",
+      text: node.children
+        .filter((c) => c.type === "text")
+        .map((c) => c.data)
+        .join(""),
+    };
+  }
+  // Processing instructions are dropped (not represented in the guest
+  // tree; data-only simplification for an HTML data model).
+  return { type: "text", text: "" };
 }
 
-function utf8Length(value: string): number {
-  return Buffer.byteLength(value, "utf8");
+// ---------------------------------------------------------------------------
+// Validation of guest-supplied trees (select/extract arguments)
+// ---------------------------------------------------------------------------
+
+function validateNode(node: unknown): asserts node is HtmlNode {
+  if (typeof node !== "object" || node === null) {
+    throw new Phase5Error("HTML_SELECT_ERROR", "invalid element structure");
+  }
+  const n = node as Record<string, unknown>;
+  if (n.type === "text" || n.type === "comment") {
+    if (typeof n.text !== "string") {
+      throw new Phase5Error("HTML_SELECT_ERROR", "invalid element structure");
+    }
+    return;
+  }
+  if (n.type !== "element") {
+    throw new Phase5Error("HTML_SELECT_ERROR", "invalid element structure");
+  }
+  if (typeof n.tagName !== "string" || n.tagName.length === 0) {
+    throw new Phase5Error("HTML_SELECT_ERROR", "invalid element structure");
+  }
+  if (typeof n.attributes !== "object" || n.attributes === null) {
+    throw new Phase5Error("HTML_SELECT_ERROR", "invalid element structure");
+  }
+  const attrs = n.attributes as Record<string, unknown>;
+  if (Object.keys(attrs).length > 1024) {
+    throw new Phase5Error("HTML_SELECT_ERROR", "invalid element structure");
+  }
+  for (const value of Object.values(attrs)) {
+    if (typeof value !== "string") {
+      throw new Phase5Error("HTML_SELECT_ERROR", "invalid element structure");
+    }
+  }
+  if (!Array.isArray(n.children)) {
+    throw new Phase5Error("HTML_SELECT_ERROR", "invalid element structure");
+  }
+  for (const child of n.children as unknown[]) {
+    validateNode(child);
+  }
+}
+
+function validateDocumentOrElement(root: unknown): HtmlDocument | HtmlElement {
+  if (typeof root !== "object" || root === null) {
+    throw new Phase5Error(
+      "HTML_SELECT_ERROR",
+      "document argument is not a parsed HTML document or element",
+    );
+  }
+  const r = root as Record<string, unknown>;
+  if (r.type === "document") {
+    if (!Array.isArray(r.children)) {
+      throw new Phase5Error(
+        "HTML_SELECT_ERROR",
+        "document argument is not a parsed HTML document or element",
+      );
+    }
+    for (const child of r.children as unknown[]) {
+      validateNode(child);
+    }
+    return root as HtmlDocument;
+  }
+  validateNode(root);
+  return root as HtmlElement;
+}
+
+// ---------------------------------------------------------------------------
+// Selecting (css-select on a rebuilt domhandler tree)
+// ---------------------------------------------------------------------------
+
+/**
+ * Wire parent/prev/next sibling pointers on a rebuilt parent node.
+ * css-select resolves descendant combinator matching by walking these
+ * ancestor links, so every rebuilt tree must be fully wired.
+ */
+function wireChildren(parent: ParentNode): void {
+  let prev: ChildNode | null = null;
+  for (const child of parent.children) {
+    child.parent = parent;
+    child.prev = prev;
+    if (prev !== null) {
+      prev.next = child;
+    }
+    prev = child;
+  }
+}
+
+/**
+ * Rebuild a domhandler node from a (validated) JSON tree node so the
+ * mature css-select engine can run on it.
+ */
+function domFromJson(node: HtmlNode): ChildNode {
+  if (node.type === "text") {
+    return new DomText(node.text);
+  }
+  if (node.type === "comment") {
+    return new DomComment(node.text);
+  }
+  const el = new DomElement(node.tagName, { ...node.attributes });
+  for (const child of node.children) {
+    el.children.push(domFromJson(child));
+  }
+  wireChildren(el);
+  return el;
+}
+
+function toInfoDom(el: DomElement): HtmlElementInfo {
+  const data: Record<string, string> = {};
+  for (const key of Object.keys(el.attribs)) {
+    const value = el.attribs[key];
+    if (value === undefined) continue;
+    if (key.startsWith("data-")) {
+      data[key.slice(5)] = value;
+    }
+  }
+  return {
+    tagName: el.name,
+    text: normalizeWhitespace(getText(el)),
+    attributes: { ...el.attribs },
+    href: el.attribs.href,
+    src: el.attribs.src,
+    class: el.attribs.class,
+    id: el.attribs.id,
+    data,
+    innerHTML: el.children.map((c) => serializeNode(c)).join(""),
+    outerHTML: serializeNode(el),
+  };
+}
+
+function normalizeWhitespace(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Convert one matched domhandler element back into a guest-tree node.
+ */
+function matchedToElement(el: DomElement): HtmlElement {
+  return {
+    type: "element",
+    tagName: el.name,
+    attributes: { ...el.attribs },
+    children: el.children.map(domChildToTree),
+  };
+}
+
+/**
+ * Select elements in a parsed document/element tree using a CSS
+ * selector. Returns the matched ELEMENTS (guest-tree nodes) so plugins
+ * can pass them to extractHtml. Invalid selectors and invalid document
+ * arguments produce Phase5Error (HTML_SELECT_ERROR). Matches are
+ * bounded by PHASE5_LIMITS.maxSelectResults.
+ */
+export function selectHtml(root: unknown, selector: string): HtmlElement[] {
+  if (typeof selector !== "string" || selector.trim() === "") {
+    throw new Phase5Error(
+      "HTML_INVALID_SELECTOR",
+      "html.select() requires a non-empty selector string",
+    );
+  }
+  const docRoot = validateDocumentOrElement(root);
+
+  let domRoot: NodeWithChildren;
+  if (docRoot.type === "document") {
+    const docNode = new DomDocument([]);
+    for (const child of docRoot.children) {
+      docNode.children.push(domFromJson(child));
+    }
+    wireChildren(docNode);
+    domRoot = docNode;
+  } else {
+    // validateDocumentOrElement guarantees an element here, which
+    // domFromJson rebuilds as a DomElement (a NodeWithChildren).
+    domRoot = domFromJson(docRoot) as NodeWithChildren;
+  }
+
+  let matches: DomElement[];
+  try {
+    matches = selectAll(selector, domRoot) as unknown as DomElement[];
+  } catch (error) {
+    throw new Phase5Error(
+      "HTML_SELECT_ERROR",
+      `Invalid selector: ${errorMessage(error)}`,
+    );
+  }
+  if (matches.length > PHASE5_LIMITS.maxSelectResults) {
+    throw new Phase5Error(
+      "HTML_TOO_MANY_RESULTS",
+      `Selector matched ${matches.length} elements; the maximum is ${PHASE5_LIMITS.maxSelectResults}`,
+    );
+  }
+  return matches.map(matchedToElement);
+}
+
+// ---------------------------------------------------------------------------
+// Extraction
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract the JSON-serializable info object for one parsed element.
+ */
+export function extractHtml(element: unknown): HtmlElementInfo {
+  if (typeof element !== "object" || element === null) {
+    throw new Phase5Error(
+      "HTML_INVALID_ELEMENT",
+      "html.extract() requires a parsed element",
+    );
+  }
+  const el = element as Record<string, unknown>;
+  if (el.type !== "element") {
+    throw new Phase5Error(
+      "HTML_EXTRACT_ERROR",
+      "html.extract() requires an element (not a document or text node)",
+    );
+  }
+  validateNode(element);
+  return toInfoDom(domFromJson(element as HtmlElement) as DomElement);
 }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function jsonLiteral(context: QuickJSContext, value: unknown): QuickJSHandle {
-  const json = JSON.stringify(value);
-  if (json === undefined) return context.undefined;
-  const result = context.evalCode(`(${json})`, "phase5-data", {
-    type: "global",
-  });
-  return context.unwrapResult(result);
-}
-
-function rejected(
-  context: QuickJSContext,
-  code: string,
-  message: string,
-): QuickJSHandle {
-  const result = context.evalCode(
-    `Promise.reject(${JSON.stringify({ code, message })})`,
-    "phase5-error",
-    { type: "global" },
-  );
-  return context.unwrapResult(result);
-}
-
-function parseHtml(source: string): HtmlDocument {
-  const root: HtmlDocument = { type: "document", children: [] };
-  const stack: HtmlElement[] = [];
-  let nodes = 1;
-  let i = 0;
-
-  const children = (): HtmlNode[] =>
-    stack.length ? stack[stack.length - 1].children : root.children;
-
-  const add = (node: HtmlNode): void => {
-    nodes += 1;
-    if (nodes > MAX_HTML_NODES) throw new Error("HTML_NODE_LIMIT");
-    children().push(node);
-  };
-
-  while (i < source.length) {
-    const lt = source.indexOf("<", i);
-
-    if (lt < 0) {
-      if (i < source.length) {
-        add({ type: "text", text: decodeEntities(source.slice(i)) });
-      }
-      break;
-    }
-
-    if (lt > i) {
-      add({
-        type: "text",
-        text: decodeEntities(source.slice(i, lt)),
-      });
-    }
-
-    if (source.startsWith("<!--", lt)) {
-      const end = source.indexOf("-->", lt + 4);
-      add({
-        type: "comment",
-        text: source.slice(lt + 4, end < 0 ? source.length : end),
-      });
-      i = end < 0 ? source.length : end + 3;
-      continue;
-    }
-
-    const gt = source.indexOf(">", lt + 1);
-    if (gt < 0) {
-      add({
-        type: "text",
-        text: decodeEntities(source.slice(lt)),
-      });
-      break;
-    }
-
-    const raw = source.slice(lt + 1, gt).trim();
-
-    if (
-      /^!doctype\b/i.test(raw) ||
-      /^\?/.test(raw) ||
-      /^!/.test(raw)
-    ) {
-      i = gt + 1;
-      continue;
-    }
-
-    if (raw.startsWith("/")) {
-      const name = raw.slice(1).trim().split(/\s+/)[0]?.toLowerCase();
-      if (name) {
-        for (let n = stack.length - 1; n >= 0; n -= 1) {
-          if (stack[n].tagName === name) {
-            stack.length = n;
-            break;
-          }
-        }
-      }
-      i = gt + 1;
-      continue;
-    }
-
-    const selfClosing = /\/\s*$/.test(raw);
-    const clean = raw.replace(/\/\s*$/, "");
-    const nameMatch = /^([^\s/>]+)/.exec(clean);
-
-    if (!nameMatch) {
-      i = gt + 1;
-      continue;
-    }
-
-    const tagName = nameMatch[1].toLowerCase();
-    const attributes: Record<string, string> = {};
-    const rest = clean.slice(nameMatch[0].length);
-
-    const attrRe =
-      /([^\s=/>]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/g;
-
-    let match: RegExpExecArray | null;
-    while ((match = attrRe.exec(rest)) !== null) {
-      attributes[match[1].toLowerCase()] = decodeEntities(
-        match[2] ?? match[3] ?? match[4] ?? "",
-      );
-    }
-
-    const element: HtmlElement = {
-      type: "element",
-      tagName,
-      attributes,
-      children: [],
-    };
-
-    add(element);
-
-    const voidTag =
-      /^(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/i.test(
-        tagName,
-      );
-
-    if (!selfClosing && !voidTag) stack.push(element);
-
-    i = gt + 1;
-
-    // Treat script/style as raw text. Never execute their contents.
-    if (tagName === "script" || tagName === "style") {
-      const close = new RegExp(`</${tagName}\\s*>`, "ig");
-      close.lastIndex = i;
-      const found = close.exec(source);
-      const end = found ? found.index : source.length;
-
-      if (end > i) {
-        add({ type: "text", text: source.slice(i, end) });
-      }
-
-      i = found ? found.index + found[0].length : source.length;
-
-      if (stack[stack.length - 1] === element) stack.pop();
-    }
-  }
-
-  return root;
-}
-
-function decodeEntities(text: string): string {
-  return text.replace(
-    /&(#x?[0-9a-f]+|amp|lt|gt|quot|apos|nbsp);/gi,
-    (all, name: string) => {
-      const n = name.toLowerCase();
-
-      if (n === "amp") return "&";
-      if (n === "lt") return "<";
-      if (n === "gt") return ">";
-      if (n === "quot") return '"';
-      if (n === "apos") return "'";
-      if (n === "nbsp") return "\u00a0";
-
-      const code =
-        n[1] === "x"
-          ? parseInt(n.slice(2), 16)
-          : parseInt(n.slice(1), 10);
-
-      return Number.isFinite(code) && code <= 0x10ffff
-        ? String.fromCodePoint(code)
-        : all;
-    },
-  );
-}
-
-interface SelectorPart {
-  tag?: string;
-  id?: string;
-  classes: string[];
-  attr?: { name: string; value?: string };
-}
-
-function parseSelector(selector: string): SelectorPart[] {
-  const parts = selector.trim().split(/\s+/);
-  if (!selector.trim()) throw new Error("invalid selector");
-  return parts.map(parseSelectorPart);
-}
-
-function parseSelectorPart(part: string): SelectorPart {
-  const attrMatch =
-    /\[([^=\]]+)(?:=["']?([^\]"']+)["']?)?\]/.exec(part);
-
-  const attr = attrMatch
-    ? {
-        name: attrMatch[1].toLowerCase(),
-        value: attrMatch[2],
-      }
-    : undefined;
-
-  const base = part.replace(/\[[^\]]+\]/g, "");
-  const id = /#([\w-]+)/.exec(base)?.[1];
-  const classes = [...base.matchAll(/\.([\w-]+)/g)].map(
-    (m) => m[1],
-  );
-  const tag = /^[a-zA-Z][\w-]*/.exec(base)?.[0]?.toLowerCase();
-
-  if (!tag && !id && classes.length === 0 && !attr) {
-    throw new Error("invalid selector");
-  }
-
-  return { tag, id, classes, attr };
-}
-
-function matches(element: HtmlElement, part: SelectorPart): boolean {
-  if (part.tag && element.tagName !== part.tag) return false;
-  if (part.id && element.attributes.id !== part.id) return false;
-
-  const classes = (element.attributes.class ?? "")
-    .split(/\s+/)
-    .filter(Boolean);
-
-  if (part.classes.some((c) => !classes.includes(c))) return false;
-
-  if (part.attr && !(part.attr.name in element.attributes)) return false;
-
-  if (
-    part.attr?.value !== undefined &&
-    element.attributes[part.attr.name] !== part.attr.value
-  ) {
-    return false;
-  }
-
-  return true;
-}
-
-function selectHtml(
-  root: HtmlDocument | HtmlElement,
-  selector: string,
-): HtmlElement[] {
-  const parts = parseSelector(selector);
-  const result: HtmlElement[] = [];
-
-  const walk = (nodes: HtmlNode[], ancestors: HtmlElement[]): void => {
-    for (const node of nodes) {
-      if (node.type !== "element") continue;
-
-      const last = parts.length - 1;
-
-      if (matches(node, parts[last])) {
-        let ai = ancestors.length - 1;
-        let pi = last - 1;
-
-        while (pi >= 0) {
-          while (ai >= 0 && !matches(ancestors[ai], parts[pi])) {
-            ai -= 1;
-          }
-
-          if (ai < 0) break;
-
-          ai -= 1;
-          pi -= 1;
-        }
-
-        if (pi < 0) result.push(node);
-      }
-
-      walk(node.children, [...ancestors, node]);
-    }
-  };
-
-  walk(root.children, []);
-  return result;
-}
-
-function textContent(element: HtmlElement): string {
-  let text = "";
-
-  const walk = (nodes: HtmlNode[]): void => {
-    for (const node of nodes) {
-      if (node.type === "text") text += node.text;
-      else if (node.type === "element") walk(node.children);
-    }
-  };
-
-  walk(element.children);
-  return text.replace(/\s+/g, " ").trim();
-}
-
-function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
-function serialize(node: HtmlNode): string {
-  if (node.type === "text") return escapeHtml(node.text);
-  if (node.type === "comment") return `<!--${node.text}-->`;
-
-  const attrs = Object.entries(node.attributes)
-    .map(([k, v]) => ` ${k}="${escapeHtml(v)}"`)
-    .join("");
-
-  const voidTag =
-    /^(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/i.test(
-      node.tagName,
-    );
-
-  if (voidTag) return `<${node.tagName}${attrs}>`;
-
-  return `<${node.tagName}${attrs}>${node.children
-    .map(serialize)
-    .join("")}</${node.tagName}>`;
-}
-
-function toInfo(element: HtmlElement): HtmlElementInfo {
-  const data: Record<string, string> = {};
-
-  for (const [key, value] of Object.entries(element.attributes)) {
-    if (key.startsWith("data-")) data[key.slice(5)] = value;
-  }
-
+// ---------------------------------------------------------------------------
+// Guest-side JSON capability (static engine source)
+// ---------------------------------------------------------------------------
+
+/**
+ * Guest-side source of the `context.json` capability.
+ *
+ * Evaluated once per capability call by the runtime into the guest.
+ * The code is a static engine constant: it references no plugin data,
+ * no host identifiers, and no globals other than `JSON` and `Object`.
+ * Error codes and the size limit are injected from the TS constants so
+ * the host and guest sides can never drift apart.
+ *
+ * The functions wrap the guest's native JSON (no host round-trip):
+ * `parse` never evaluates code, and `stringify` reports circular
+ * structures as a structured error instead of silently dropping them.
+ */
+export const PHASE5_JSON_GUEST_SOURCE = `(function () {
+  const CODES = ${JSON.stringify({
+    invalidInput: "JSON_INVALID_INPUT",
+    inputTooLarge: "JSON_INPUT_TOO_LARGE",
+    invalid: "JSON_INVALID",
+    outputTooLarge: "JSON_OUTPUT_TOO_LARGE",
+    stringifyError: "JSON_STRINGIFY_ERROR",
+  })};
+  const MAX_BYTES = ${PHASE5_LIMITS.maxJsonBytes};
   return {
-    tagName: element.tagName,
-    text: textContent(element),
-    attributes: { ...element.attributes },
-    href: element.attributes.href,
-    src: element.attributes.src,
-    class: element.attributes.class,
-    id: element.attributes.id,
-    data,
-    innerHTML: element.children.map(serialize).join(""),
-    outerHTML: serialize(element),
+    parse: function parse(text) {
+      if (typeof text !== "string") {
+        throw {
+          code: CODES.invalidInput,
+          message: "json.parse(text) requires a string",
+        };
+      }
+      if (text.length > MAX_BYTES) {
+        throw {
+          code: CODES.inputTooLarge,
+          message: "JSON input exceeds 5 MiB",
+        };
+      }
+      try {
+        return JSON.parse(text);
+      } catch (e) {
+        throw {
+          code: CODES.invalid,
+          message: "Invalid JSON" + (e && e.message ? ": " + e.message : ""),
+        };
+      }
+    },
+    stringify: function stringify(value) {
+      if (arguments.length === 0) {
+        throw {
+          code: CODES.invalidInput,
+          message: "json.stringify(value) requires a value argument",
+        };
+      }
+      let out;
+      try {
+        out = JSON.stringify(value);
+      } catch (e) {
+        throw {
+          code: CODES.stringifyError,
+          message:
+            "Value is not JSON-serializable" +
+            (e && e.message ? ": " + e.message : ""),
+        };
+      }
+      if (typeof out !== "string") {
+        throw {
+          code: CODES.invalidInput,
+          message:
+            "Value is not JSON-serializable (top-level undefined or function)",
+        };
+      }
+      if (out.length > MAX_BYTES) {
+        throw {
+          code: CODES.outputTooLarge,
+          message: "JSON output exceeds 5 MiB",
+        };
+      }
+      return out;
+    },
   };
-}
+})()`;

@@ -1,16 +1,18 @@
 /**
  * Core types for plugin manifests, plugins, and validation results.
  *
- * Phase 4: these types describe plugin metadata, the sandboxed execution
- * result types, and the controlled HTTP capability contract. Plugin code
+ * Phase 5: these types describe plugin metadata, the sandboxed execution
+ * result types, the controlled HTTP capability contract (Phase 4), and
+ * the JSON/HTML parsing capability contract (Phase 5). Plugin code
  * executes inside a QuickJS (Wasm) runtime with a controlled API — see
- * src/runtime.ts and src/http.ts.
+ * src/runtime.ts, src/http.ts, and src/phase5.ts.
  */
 import type {
   HttpLimits,
   HttpRequestOptions,
   HttpResponse,
 } from "./http.js";
+import type { PluginHtml, PluginJson } from "./phase5-types.js";
 
 /**
  * A plugin manifest as declared in `<plugin dir>/manifest.json`.
@@ -138,6 +140,18 @@ export interface PluginContext {
    * redirects, headers) — see src/http.ts for the limits.
    */
   readonly http: PluginHttp;
+  /**
+   * Bounded JSON parsing/serialization (Phase 5). Synchronous; throws
+   * structured { code, message } errors. Parsing is a pure data
+   * operation and never evaluates code.
+   */
+  readonly json: PluginJson;
+  /**
+   * Data-only HTML parsing, CSS selection, and element extraction
+   * (Phase 5). No script/event-handler execution, no resource loading,
+   * bounded input/node/result limits, structured errors.
+   */
+  readonly html: PluginHtml;
 }
 
 /** Structured runtime error types returned by the PluginRuntime. */

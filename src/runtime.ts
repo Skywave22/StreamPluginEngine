@@ -6,7 +6,7 @@
  * engine from the host Node.js process: the plugin realm contains no
  * Node.js globals, no host objects, and no built-in modules. Plugins
  * communicate with the host exclusively through the controlled
- * PluginContext (manifest + log + http) and by returning
+ * PluginContext (manifest + log + http + json + html) and by returning
  * JSON-serializable values.
  *
  * Phase 4 adds the controlled HTTP capability: `context.http.get` /
@@ -15,6 +15,13 @@
  * happens host-side in HttpClient (src/http.ts) and the settled,
  * validated result is bridged back into the guest. Plugins never touch
  * Node networking directly.
+ *
+ * Phase 5 adds the JSON and HTML parsing capabilities: `context.json`
+ * is a static guest-side source wrapping the guest's native JSON (no
+ * host round-trip, parse never evaluates code); `context.html` is
+ * host-side on top of htmlparser2 + css-select + dom-serializer
+ * (src/phase5.ts), data-only: no script execution, no resource
+ * loading, bounded input/node/result limits, structured errors.
  *
  * Isolation model and its limits:
  * - Each loaded plugin gets its own QuickJS runtime (separate heap).
@@ -46,6 +53,15 @@ import type {
 
 import { HttpClient, HttpError } from "./http.js";
 import type { HttpRequestOptions, HttpErrorObject } from "./http.js";
+import {
+  PHASE5_JSON_GUEST_SOURCE,
+  PHASE5_LIMITS,
+  Phase5Error,
+  extractHtml,
+  parseHtml,
+  selectHtml,
+} from "./phase5.js";
+import type { Phase5ErrorCode } from "./phase5.js";
 import type {
   LoadedPlugin,
   Plugin,
@@ -653,10 +669,205 @@ export class PluginRuntime {
     context.setProp(httpObject, "getJson", getJsonFn);
     context.setProp(httpObject, "request", requestFn);
 
+    // context.json — Phase 5. The implementation is a STATIC guest-side
+    // source (no plugin data, no host identifiers) wrapping the guest's
+    // native JSON. It throws structured { code, message } objects on
+    // failure. No value crosses the Wasm boundary for JSON work.
+    const jsonEvalResult = track(
+      context.evalCode(PHASE5_JSON_GUEST_SOURCE, "phase5-json", {
+        type: "global",
+      }),
+      tracked,
+    );
+    const jsonObject = context.unwrapResult(jsonEvalResult);
+    track(jsonObject, tracked);
+
+    // context.html — Phase 5. Host-bridged synchronous functions: the
+    // work (parse/select/serialize) happens host-side in src/phase5.ts
+    // and the result crosses back as plain JSON. Failures return a
+    // rejected promise carrying a structured { code, message } object.
+    const htmlObject = track(context.newObject(), tracked);
+    const htmlParseFn = track(
+      context.newFunction("parse", (...args: QuickJSHandle[]) =>
+        this.phase5Parse(handle, args[0], tracked),
+      ),
+      tracked,
+    );
+    const htmlSelectFn = track(
+      context.newFunction("select", (...args: QuickJSHandle[]) =>
+        this.phase5Select(handle, args[0], args[1], tracked),
+      ),
+      tracked,
+    );
+    const htmlExtractFn = track(
+      context.newFunction("extract", (...args: QuickJSHandle[]) =>
+        this.phase5Extract(handle, args[0], tracked),
+      ),
+      tracked,
+    );
+    context.setProp(htmlObject, "parse", htmlParseFn);
+    context.setProp(htmlObject, "select", htmlSelectFn);
+    context.setProp(htmlObject, "extract", htmlExtractFn);
+
     context.setProp(contextObject, "manifest", manifestHandle);
     context.setProp(contextObject, "log", logFn);
     context.setProp(contextObject, "http", httpObject);
+    context.setProp(contextObject, "json", jsonObject);
+    context.setProp(contextObject, "html", htmlObject);
     return contextObject;
+  }
+
+  /**
+   * Settle a Phase 5 HTML failure: return a handle to a REJECTED PROMISE
+   * carrying the structured { code, message } object. The guest awaits
+   * it (or the capability's unhandled rejection surfaces to the host as
+   * a structured PLUGIN_RUNTIME_ERROR, same path as HTTP errors).
+   */
+  private phase5Rejected(
+    handle: LoadedPluginHandle,
+    code: Phase5ErrorCode,
+    message: string,
+    tracked: Disposable[],
+  ): QuickJSHandle {
+    const context = handle.context;
+    const deferred = track(context.newPromise(), tracked);
+    const errorHandle = this.jsonToHandle(
+      context,
+      { code, message },
+      tracked,
+    );
+    deferred.reject(errorHandle);
+    errorHandle.dispose();
+    // The deferred (and its resolvers) is released by the tracked drain;
+    // the framework owns the promise handle.
+    return deferred.handle;
+  }
+
+  private phase5Parse(
+    handle: LoadedPluginHandle,
+    arg: QuickJSHandle | undefined,
+    tracked: Disposable[],
+  ): QuickJSHandle {
+    const context = handle.context;
+    if (arg === undefined || context.typeof(arg) !== "string") {
+      return this.phase5Rejected(
+        handle,
+        "HTML_INVALID_INPUT",
+        "html.parse() requires a string",
+        tracked,
+      );
+    }
+    const html = context.getString(arg);
+    if (Buffer.byteLength(html, "utf8") > PHASE5_LIMITS.maxHtmlBytes) {
+      return this.phase5Rejected(
+        handle,
+        "HTML_INPUT_TOO_LARGE",
+        "HTML input exceeds 5 MiB",
+        tracked,
+      );
+    }
+    try {
+      return this.jsonToHandle(context, parseHtml(html), tracked);
+    } catch (error) {
+      // Only engine-controlled text crosses the boundary: Phase5Error
+      // messages are engine-authored, and anything unexpected is mapped
+      // to a fixed safe message (host details never reach the guest).
+      return this.phase5Rejected(
+        handle,
+        error instanceof Phase5Error ? error.code : "HTML_PARSE_ERROR",
+        error instanceof Phase5Error
+          ? error.message
+          : "HTML parsing failed",
+        tracked,
+      );
+    }
+  }
+
+  private phase5Select(
+    handle: LoadedPluginHandle,
+    docArg: QuickJSHandle | undefined,
+    selArg: QuickJSHandle | undefined,
+    tracked: Disposable[],
+  ): QuickJSHandle {
+    const context = handle.context;
+    if (
+      docArg === undefined ||
+      selArg === undefined ||
+      context.typeof(selArg) !== "string"
+    ) {
+      return this.phase5Rejected(
+        handle,
+        "HTML_INVALID_SELECTOR",
+        "html.select(document, selector) requires a selector string",
+        tracked,
+      );
+    }
+    let root: unknown;
+    try {
+      root = context.dump(docArg);
+    } catch {
+      return this.phase5Rejected(
+        handle,
+        "HTML_SELECT_ERROR",
+        "document argument is not JSON-serializable",
+        tracked,
+      );
+    }
+    try {
+      return this.jsonToHandle(
+        context,
+        selectHtml(root, context.getString(selArg)),
+        tracked,
+      );
+    } catch (error) {
+      return this.phase5Rejected(
+        handle,
+        error instanceof Phase5Error ? error.code : "HTML_SELECT_ERROR",
+        error instanceof Phase5Error
+          ? error.message
+          : "HTML selection failed",
+        tracked,
+      );
+    }
+  }
+
+  private phase5Extract(
+    handle: LoadedPluginHandle,
+    elementArg: QuickJSHandle | undefined,
+    tracked: Disposable[],
+  ): QuickJSHandle {
+    const context = handle.context;
+    if (elementArg === undefined) {
+      return this.phase5Rejected(
+        handle,
+        "HTML_INVALID_ELEMENT",
+        "html.extract() requires an element",
+        tracked,
+      );
+    }
+    let element: unknown;
+    try {
+      element = context.dump(elementArg);
+    } catch {
+      return this.phase5Rejected(
+        handle,
+        "HTML_EXTRACT_ERROR",
+        "element argument is not JSON-serializable",
+        tracked,
+      );
+    }
+    try {
+      return this.jsonToHandle(context, extractHtml(element), tracked);
+    } catch (error) {
+      return this.phase5Rejected(
+        handle,
+        error instanceof Phase5Error ? error.code : "HTML_EXTRACT_ERROR",
+        error instanceof Phase5Error
+          ? error.message
+          : "HTML extraction failed",
+        tracked,
+      );
+    }
   }
 
   /**
