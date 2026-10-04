@@ -6,6 +6,51 @@ project follows [semantic versioning](https://semver.org/spec/v2.0.0.html).
 While the version is `0.x`, the plugin contract may still change; the
 engine reports the contract revision it implements as `ENGINE_API_VERSION`.
 
+## [0.4.2] — 2026-10-04
+
+### Fixed
+
+- **HTML depth was platform-dependent; the legacy `apiVersion: 1` path now
+  enforces a constant limit.** The engine detected "too deep" by letting
+  the sandbox run out of stack and then inspecting the resulting error.
+  Where that happens depends on the host operating system, so the same
+  document behaved differently per platform: on CI, a 300-level document
+  parsed on Ubuntu and failed on macOS, and on Windows a 2,000-level
+  document produced a generic `HTML parsing failed` instead of the
+  structured `HTML_PARSE_ERROR` the tests and plugins expect, because a
+  Wasm trap is not a `RangeError`. Delivery depth is now capped explicitly
+  at `PHASE5_LIMITS.maxHtmlDeliveryDepth` (128) inside `parseHtml` via an
+  opt-in `maxDepth` option that only the v1 path sets, so the limit is a
+  documented constant identical on every OS — and the handle-based
+  `apiVersion: 2` API, which never delivers a tree into the sandbox, keeps
+  its unlimited depth. A residual stack-exhaustion fallback
+  (`isStackExhaustion`) still reports the depth limit rather than a generic
+  failure if a platform's stack is smaller than the cap assumes.
+
+  Contract note: a v1 document deeper than 128 levels is now rejected
+  everywhere. Previously it was accepted or rejected depending on which
+  operating system ran it — not a contract anyone could rely on.
+
+- **The child-process regression test could not run on Windows.** It
+  generated a module that imported the engine from a bare absolute path
+  (`D:\\a\\...`), which Node's ESM loader rejects with
+  `ERR_UNSUPPORTED_ESM_URL_SCHEME`. Now emitted through `pathToFileURL`.
+
+- Two tests encoded the Linux assumption (a 300-level document assumed
+  safely inside the boundary) and are retuned to the enforced cap.
+
+- No engine behaviour changed for `apiVersion: 2`, and
+  `ENGINE_API_VERSION` is unchanged at 2, so no plugin needs revalidating
+  unless it uses the legacy v1 HTML API with documents deeper than 128.
+
+### Added
+
+- Four regression tests pinning the new behaviour: the cap is opt-in and
+  uncapped by default, it is exact and counts siblings rather than
+  cumulative open tags, the message is engine-authored and states the
+  number, and `isStackExhaustion` recognises every platform's way of
+  reporting an exhausted stack.
+
 ## [0.4.1] — 2026-10-04
 
 ### Fixed

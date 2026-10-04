@@ -280,15 +280,18 @@ owns all parsing.
   does not run guest code.
 - **Deep-structure behavior.** All host-side tree transforms are
   iterative, so the host API (`parseHtml`/`selectHtml`/`extractHtml`)
-  supports the full node budget including 50,000-deep chains. The GUEST
-  path additionally crosses the Wasm boundary: delivering a value into
-  the sandbox uses a JSON literal evaluation, so documents deeper than
-  roughly 500 nesting levels (the QuickJS evaluator's stack limit) fail
-  with a structured `HTML_PARSE_ERROR` naming the depth limit. Per-element
-  extraction/serialization of extremely deep subtrees (the mature
-  library's own recursion) similarly fails structured (`HTML_EXTRACT_ERROR`).
-  ~500 levels is far beyond real-world HTML (renderers typically stop far
-  below that); the behavior is deterministic and safe, never a crash.
+  supports the full node budget including 50,000-deep chains. The
+  `apiVersion: 2` handle path never delivers a tree into the sandbox, so it
+  has no nesting limit at all. The legacy `apiVersion: 1` path does
+  deliver one, and caps nesting at `PHASE5_LIMITS.maxHtmlDeliveryDepth`
+  (128), failing deeper documents with a structured `HTML_PARSE_ERROR`
+  naming the limit. That cap is an enforced constant, because the depth at
+  which delivery exhausts the stack is a property of the host platform, not
+  of the document: before the cap, a 300-level document parsed on Ubuntu
+  and failed on macOS. Per-element extraction/serialization of extremely
+  deep subtrees similarly fails structured (`HTML_EXTRACT_ERROR`). 128
+  levels is far beyond real-world HTML (renderers stop far below that), and
+  the behaviour is now identical on every operating system.
 - **Security.** Parsing is data-only: no JavaScript execution, no event
   handlers, no resource loading, no following of `href`/`src`, no
   filesystem or environment access. `javascript:` URLs and `on*` handler
@@ -508,8 +511,8 @@ v2:  html.parse(html)     → id    (a number)
 ```
 
 Consequences beyond speed (6.5x / 7.1x / 4.7x measured): no value is
-delivered into the guest for HTML work, so the ~500-level nesting limit
-disappears; hand-built document objects can no longer be fed to the
+delivered into the guest for HTML work, so the legacy nesting limit that
+the tree-based API needs does not apply; hand-built document objects can no longer be fed to the
 selector engine; and the handle table is bounded per call
 (`PHASE5_LIMITS.maxHtmlHandles`) and cleared when the call ends — which
 is what makes `HTML_STALE_HANDLE` a structured answer rather than a

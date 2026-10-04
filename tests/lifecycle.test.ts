@@ -31,7 +31,7 @@ import { createServer, type Server } from "node:http";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { after, before, test, type TestContext } from "node:test";
 
 import { PluginRuntime } from "../src/runtime.js";
@@ -387,7 +387,7 @@ test("concurrency: overlapping operations never lose the timeout guard (regressi
     script,
     `
 import { createServer } from "node:http";
-import { PluginRuntime } from ${JSON.stringify(path.join(distSrc, "runtime.js"))};
+import { PluginRuntime } from ${JSON.stringify(pathToFileURL(path.join(distSrc, "runtime.js")).href)};
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 

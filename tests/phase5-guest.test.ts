@@ -464,14 +464,15 @@ test("sandbox boundary: no process / require / host fetch reachable from Phase 5
 });
 
 test("html.parse: deep nesting within the guest boundary works end to end", async (t) => {
-  // ~500 nesting levels is the sandbox value-delivery boundary; 300
-  // levels is safely inside it. This proves the full path
-  // (guest string -> host parse -> JSON back into the guest -> select).
+  // The legacy v1 API delivers the whole tree into the guest, so the
+  // engine caps its depth at PHASE5_LIMITS.maxHtmlDeliveryDepth. 64 is
+  // comfortably inside that cap on every platform. This proves the full
+  // path (guest string -> host parse -> JSON into the guest -> select).
   const value = (await runCapability(
     t,
     `export const plugin = {
       run: async (context) => {
-        const depth = 300;
+        const depth = 64;
         const html = "<div>".repeat(depth) + '<i id="bottom">b</i>' + "</div>".repeat(depth);
         const doc = await context.html.parse(html);
         const matches = await context.html.select(doc, "#bottom");
@@ -489,9 +490,9 @@ test("html.parse: deep nesting within the guest boundary works end to end", asyn
 });
 
 test("html.parse: beyond the guest depth boundary is a structured HTML_PARSE_ERROR", async (t) => {
-  // 2,000 levels exceeds the ~500-level sandbox delivery boundary. The
-  // engine must fail with a structured error (never a crash), and the
-  // message must be engine-controlled.
+  // 2,000 levels is far past the enforced v1 delivery depth cap. The
+  // engine must fail with a structured error (never a crash) on every
+  // platform, and the message must be engine-controlled.
   const value = (await runCapability(
     t,
     `export const plugin = {

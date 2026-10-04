@@ -45,8 +45,9 @@ hot path:
   surplus gets `HTTP_TOO_MANY_REQUESTS`.
 - **Plugin API v2: handle-based `context.html`** — only integers cross
   the boundary, so `parse` is 6.5x, `select` 7x and `extract` 4.7x faster,
-  the ~500-level nesting limit is gone, and no untrusted document object
-  reaches the selector engine. `apiVersion: 1` plugins are unchanged.
+  the nesting limit that the legacy tree-based API has does not apply, and
+  no untrusted document object reaches the selector engine. `apiVersion: 1`
+  plugins are unchanged.
 
 **v0.2.0 makes the engine enforce what a manifest declares.** A review of
 0.1.0 found that `domains` was validated and stored but never read — a
@@ -487,10 +488,14 @@ them.
 
 **Deep-structure behavior:** the host-side parser supports the full node
 budget (including 50,000-deep chains — all tree transforms are
-iterative). Through the guest (`context.html.*`), documents deeper than
-roughly 500 nesting levels — the sandbox value-delivery boundary — fail
-with a structured `HTML_PARSE_ERROR` instead of crashing. This is far
-beyond real-world HTML depth and is deterministic.
+iterative). The `apiVersion: 2` handle API has no nesting limit at all.
+The legacy `apiVersion: 1` API delivers the whole tree into the sandbox, so
+the engine caps nesting at `PHASE5_LIMITS.maxHtmlDeliveryDepth` (128) and
+fails deeper documents with a structured `HTML_PARSE_ERROR` instead of
+crashing. The cap is an **enforced constant**, not a stack boundary: the
+depth at which delivery runs out of stack varies by operating system, so
+the same document used to parse on Linux and fail on macOS. 128 is still
+far beyond real-world HTML depth.
 
 ## Source result pipeline (Phase 6)
 

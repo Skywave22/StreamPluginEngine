@@ -11,6 +11,7 @@ import {
   PHASE5_LIMITS,
   Phase5Error,
   extractHtml,
+  isStackExhaustion,
   parseHtml,
   selectHtml,
 } from "../src/phase5.js";
@@ -314,4 +315,69 @@ test("extractHtml: rejects documents, text nodes, and garbage", () => {
 test("PHASE5_ERROR_CODES is a stable, unique list", () => {
   assert.equal(new Set(PHASE5_ERROR_CODES).size, PHASE5_ERROR_CODES.length);
   assert.ok(PHASE5_ERROR_CODES.every((c) => typeof c === "string" && c.length > 0));
+});
+
+// ---------------------------------------------------------------------------
+// Depth: an enforced constant, not wherever the platform's stack gives out
+// ---------------------------------------------------------------------------
+
+test("parseHtml: maxDepth is opt-in and uncapped by default", () => {
+  // The handle-based (apiVersion 2) path must still parse to the full node
+  // budget, so the cap has to stay opt-in.
+  const deep = parseHtml("<div>".repeat(2_000) + "leaf" + "</div>".repeat(2_000));
+  assert.equal(deep.children.length, 1);
+  // The same document is rejected when a caller opts into a cap.
+  assertPhase5Error(
+    () =>
+      parseHtml("<div>".repeat(2_000) + "leaf" + "</div>".repeat(2_000), {
+        maxDepth: PHASE5_LIMITS.maxHtmlDeliveryDepth,
+      }),
+    "HTML_PARSE_ERROR",
+  );
+});
+
+test("parseHtml: the depth cap is exact and counts siblings, not cumulative opens", () => {
+  const capped = { maxDepth: 8 };
+  const nest = (n: number): string =>
+    "<div>".repeat(n) + "x" + "</div>".repeat(n);
+  // Exactly at the cap is accepted.
+  assert.equal(parseHtml(nest(8), capped).children.length, 1);
+  // One deeper is rejected.
+  assertPhase5Error(() => parseHtml(nest(9), capped), "HTML_PARSE_ERROR");
+  // Siblings must not accumulate: 500 siblings at depth 1 are fine,
+  // proving depth is tracked by close tags rather than by counting opens.
+  assert.equal(
+    parseHtml("<i></i>".repeat(500), capped).children.length,
+    500,
+  );
+});
+
+test("parseHtml: exceeding the depth cap reports the engine-authored limit", () => {
+  try {
+    parseHtml("<div>".repeat(500) + "x" + "</div>".repeat(500), {
+      maxDepth: PHASE5_LIMITS.maxHtmlDeliveryDepth,
+    });
+    assert.fail("expected HTML_PARSE_ERROR");
+  } catch (error) {
+    assert.ok(error instanceof Phase5Error);
+    assert.equal(error.code, "HTML_PARSE_ERROR");
+    // The message is engine-controlled and states the number, so it is
+    // identical on every platform -- the whole point of the cap.
+    assert.match(error.message, /too deep/i);
+    assert.match(error.message, new RegExp(String(PHASE5_LIMITS.maxHtmlDeliveryDepth)));
+  }
+});
+
+test("isStackExhaustion: every platform's way of reporting an exhausted stack", () => {
+  // Most platforms raise RangeError; some surface a Wasm trap whose text
+  // differs. Both must be recognised so the guest sees one stable reason.
+  assert.equal(isStackExhaustion(new RangeError("Maximum call stack size exceeded")), true);
+  assert.equal(
+    isStackExhaustion(new Error("Maximum call stack size exceeded")),
+    true,
+  );
+  assert.equal(isStackExhaustion(new Error("invalid tag name")), false);
+  assert.equal(isStackExhaustion(new TypeError("x is not a function")), false);
+  assert.equal(isStackExhaustion(undefined), false);
+  assert.equal(isStackExhaustion("boom"), false);
 });

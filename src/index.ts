@@ -12,7 +12,7 @@
  */
 
 export const ENGINE_NAME = "stream-plugin-engine";
-export const ENGINE_VERSION = "0.4.1";
+export const ENGINE_VERSION = "0.4.2";
 /**
  * The engine's PRODUCTION RUNTIME capability level: Phase 6 (normalized
  * source result pipeline) is the last phase that adds runtime behaviour.

@@ -63,6 +63,22 @@ export const PHASE5_LIMITS = {
    * working set rather than the plugin's lifetime.
    */
   maxHtmlHandles: 4_096,
+  /**
+   * Maximum nesting depth for the LEGACY (apiVersion 1) html.parse, which
+   * delivers the whole document tree into the guest as a single value.
+   *
+   * That delivery is bounded by the QuickJS evaluator's stack, and the
+   * depth at which it gives up depends on the host platform's stack size:
+   * measured on CI, Ubuntu tolerated 300 levels, macOS did not, and
+   * Windows failed with a trap rather than a catchable error. Depending on
+   * stack exhaustion made the engine behave differently per OS, so the
+   * limit is now an enforced constant, chosen well below every observed
+   * platform boundary. 128 is still far beyond real-world HTML.
+   *
+   * apiVersion 2 (handle-based) has no depth limit at all: it never
+   * delivers a tree into the guest, so the boundary does not apply.
+   */
+  maxHtmlDeliveryDepth: 128,
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -178,8 +194,15 @@ export interface HtmlElementInfo {
  * a pathological document aborts as soon as the limit is exceeded
  * instead of being fully materialized.
  */
-export function parseHtml(source: string): HtmlDocument {
+export function parseHtml(
+  source: string,
+  options?: { readonly maxDepth?: number },
+): HtmlDocument {
   const dom = new DomHandler();
+  // `maxDepth` is opt-in and only the legacy v1 delivery path sets it; the
+  // handle-based API must keep parsing to the full node budget.
+  const maxDepth = options?.maxDepth;
+  let depth = 0;
   let nodes = 1; // the document root
   const count = (): void => {
     nodes += 1;
@@ -196,12 +219,29 @@ export function parseHtml(source: string): HtmlDocument {
   // errors (unlike the parseDocument convenience wrapper), so the limit
   // aborts the parse immediately.
   const originalOpen = dom.onopentag.bind(dom);
+  // domhandler types onclosetag as `() => void`, but the parser calls it
+  // with (name, isImplied); narrow it locally instead of casting at use.
+  const closable = dom as unknown as {
+    onclosetag: (name: string, isImplied: boolean) => void;
+  };
+  const originalClose = closable.onclosetag.bind(dom);
   const originalText = dom.ontext.bind(dom);
   const originalComment = dom.oncomment.bind(dom);
   const originalPi = dom.onprocessinginstruction.bind(dom);
   dom.onopentag = (name, attribs) => {
+    depth += 1;
+    if (maxDepth !== undefined && depth > maxDepth) {
+      throw new Phase5Error(
+        "HTML_PARSE_ERROR",
+        `HTML structure is too deep for the sandbox (depth limit is ${maxDepth} nesting levels)`,
+      );
+    }
     count();
     originalOpen(name, attribs);
+  };
+  closable.onclosetag = (name, isImplied) => {
+    depth = depth > 0 ? depth - 1 : 0;
+    originalClose(name, isImplied);
   };
   dom.ontext = (text) => {
     count();
@@ -223,6 +263,27 @@ export function parseHtml(source: string): HtmlDocument {
   parser.end();
 
   return domToTree(dom.root);
+}
+
+/**
+ * True when an error looks like stack exhaustion rather than a genuine
+ * parse failure.
+ *
+ * The legacy v1 API delivers a whole document tree into the guest, and
+ * that delivery is bounded by the host platform's stack. Platforms
+ * disagree on how they report running out: most raise a `RangeError`,
+ * some surface a Wasm trap as a `RuntimeError` with a different message.
+ * Both mean the same thing to a plugin -- the document is too deep -- so
+ * this narrows them to one stable, engine-authored reason. Only the
+ * *choice* of message depends on the text; the message itself never
+ * crosses the boundary.
+ */
+export function isStackExhaustion(error: unknown): boolean {
+  if (error instanceof RangeError) return true;
+  return (
+    error instanceof Error &&
+    /call stack|stack size|recursion|maximum depth/i.test(error.message)
+  );
 }
 
 /**

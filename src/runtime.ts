@@ -61,6 +61,7 @@ import {
   PHASE5_LIMITS,
   Phase5Error,
   extractHtml,
+  isStackExhaustion,
   parseHtml,
   selectHtml,
 } from "./phase5.js";
@@ -1563,20 +1564,29 @@ export class PluginRuntime {
       );
     }
     try {
-      return this.jsonToHandle(context, parseHtml(html), tracked);
+      // The legacy v1 API hands the whole tree to the guest, so its depth
+      // is capped explicitly. Without the cap the boundary was wherever
+      // the host platform's stack ran out, which differs per OS -- the
+      // same document parsed on Ubuntu and failed on macOS.
+      return this.jsonToHandle(
+        context,
+        parseHtml(html, { maxDepth: PHASE5_LIMITS.maxHtmlDeliveryDepth }),
+        tracked,
+      );
     } catch (error) {
       // Only engine-controlled text crosses the boundary: Phase5Error
       // messages are engine-authored, and anything unexpected is mapped
       // to a fixed safe message (host details never reach the guest).
-      // A RangeError here means the document is deeper than the sandbox
-      // value-delivery boundary (~500 levels, a QuickJS evaluator limit).
+      // Exhaustion below the cap means this platform's stack is smaller
+      // than the cap assumes; still report the depth limit, so the guest
+      // sees one stable reason on every OS.
       return this.phase5Rejected(
         handle,
         error instanceof Phase5Error ? error.code : "HTML_PARSE_ERROR",
         error instanceof Phase5Error
           ? error.message
-          : error instanceof RangeError
-            ? "HTML structure is too deep for the sandbox (depth limit is about 500 nesting levels)"
+          : isStackExhaustion(error)
+            ? `HTML structure is too deep for the sandbox (depth limit is ${PHASE5_LIMITS.maxHtmlDeliveryDepth} nesting levels)`
             : "HTML parsing failed",
         tracked,
       );
