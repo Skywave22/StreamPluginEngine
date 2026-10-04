@@ -3,6 +3,7 @@ import { test } from "node:test";
 
 import * as engine from "../src/index.js";
 import {
+  ENGINE_API_VERSION,
   ENGINE_NAME,
   ENGINE_PHASE,
   ENGINE_VERSION,
@@ -16,9 +17,22 @@ import {
 
 test("foundation compiles and exports engine identity", () => {
   assert.equal(ENGINE_NAME, "stream-plugin-engine");
-  assert.equal(ENGINE_VERSION, "0.1.0");
+  // 0.2.0 adds enforced manifest domains, capability permissions,
+  // apiVersion, and engine-owned enable/disable. No runtime phase change.
+  assert.equal(ENGINE_VERSION, "0.2.0");
   // Regression: the engine reports the FINAL phase (Phase 6).
   assert.equal(ENGINE_PHASE, 6);
+});
+
+test("plugin API version and domain-policy helpers are exported", () => {
+  assert.equal(ENGINE_API_VERSION, 1);
+  assert.equal(typeof engine.normalizeDomainPattern, "function");
+  assert.equal(typeof engine.domainPatternMatches, "function");
+  assert.equal(typeof engine.isHostAllowed, "function");
+  assert.equal(typeof engine.checkDeclaredDomain, "function");
+  assert.equal(typeof engine.isSubdomainOnlyPattern, "function");
+  // The new structured error code is part of the public code list.
+  assert.ok(HTTP_ERROR_CODES.includes("HTTP_DOMAIN_NOT_ALLOWED"));
 });
 
 test("Phase 4 HTTP exports are present and coherent", () => {

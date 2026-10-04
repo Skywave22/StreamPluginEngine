@@ -5,6 +5,7 @@
   "author": "StreamPluginEngine",
   "description": "Example plugin used to verify discovery and loading.",
   "entry": "plugin.js",
+  "apiVersion": 1,
   "domains": [
     "example.com"
   ]

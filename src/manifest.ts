@@ -22,7 +22,20 @@ const KNOWN_FIELDS: ReadonlySet<string> = new Set([
   "author",
   "description",
   "domains",
+  "apiVersion",
 ]);
+
+/**
+ * The plugin API version this engine implements (the contract between a
+ * plugin and the engine: the context surface + capability semantics).
+ *
+ * Bump this only when the plugin contract changes incompatibly. A
+ * manifest may declare `apiVersion`; requiring a version this engine does
+ * not implement is rejected at validation time, so an incompatible
+ * plugin fails loudly at load instead of mysteriously at runtime.
+ * Absent means 1 (the original contract).
+ */
+export const ENGINE_API_VERSION = 1;
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -41,7 +54,8 @@ export function validateManifest(input: unknown): ManifestValidationResult {
     return { ok: false, errors: ["Plugin manifest: expected a JSON object"] };
   }
 
-  const { id, name, version, entry, author, description, domains } = input;
+  const { id, name, version, entry, author, description, domains, apiVersion } =
+    input;
   const errors: string[] = [];
 
   for (const field of Object.keys(input)) {
@@ -115,6 +129,22 @@ export function validateManifest(input: unknown): ManifestValidationResult {
     }
   }
 
+  if (apiVersion !== undefined) {
+    if (
+      typeof apiVersion !== "number" ||
+      !Number.isInteger(apiVersion) ||
+      apiVersion < 1
+    ) {
+      errors.push(
+        "Plugin manifest: 'apiVersion' must be a positive integer (e.g. 1)",
+      );
+    } else if (apiVersion > ENGINE_API_VERSION) {
+      errors.push(
+        `Plugin manifest: 'apiVersion' ${apiVersion} is not supported by this engine (implements ${ENGINE_API_VERSION})`,
+      );
+    }
+  }
+
   if (errors.length > 0) {
     return { ok: false, errors };
   }
@@ -134,6 +164,9 @@ export function validateManifest(input: unknown): ManifestValidationResult {
   }
   if (Array.isArray(domains)) {
     manifest.domains = domains as string[];
+  }
+  if (typeof apiVersion === "number") {
+    manifest.apiVersion = apiVersion;
   }
 
   return { ok: true, manifest };

@@ -1,19 +1,70 @@
 {
   "name": "stream-plugin-engine",
-  "version": "0.1.0",
-  "description": "Lightweight, cross-platform JavaScript/TypeScript plugin engine for a future media/streaming application.",
+  "version": "0.2.0",
+  "description": "Lightweight, cross-platform JavaScript/TypeScript plugin engine for a future media/streaming application: sandboxed QuickJS plugins, engine-controlled HTTP with an SSRF policy and enforced manifest domains, HTML/JSON parsing, and a normalized source-result pipeline.",
   "keywords": [
     "plugin",
     "engine",
     "streaming",
-    "typescript"
+    "typescript",
+    "sandbox",
+    "quickjs",
+    "wasm",
+    "ssrf"
   ],
   "license": "GPL-3.0-only",
   "type": "module",
   "main": "dist/src/index.js",
   "types": "dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    },
+    "./manifest": {
+      "types": "./dist/src/manifest.d.ts",
+      "import": "./dist/src/manifest.js"
+    },
+    "./loader": {
+      "types": "./dist/src/loader.d.ts",
+      "import": "./dist/src/loader.js"
+    },
+    "./manager": {
+      "types": "./dist/src/manager.d.ts",
+      "import": "./dist/src/manager.js"
+    },
+    "./runtime": {
+      "types": "./dist/src/runtime.d.ts",
+      "import": "./dist/src/runtime.js"
+    },
+    "./http": {
+      "types": "./dist/src/http.d.ts",
+      "import": "./dist/src/http.js"
+    },
+    "./network": {
+      "types": "./dist/src/network.d.ts",
+      "import": "./dist/src/network.js"
+    },
+    "./phase5": {
+      "types": "./dist/src/phase5.d.ts",
+      "import": "./dist/src/phase5.js"
+    },
+    "./results": {
+      "types": "./dist/src/results.d.ts",
+      "import": "./dist/src/results.js"
+    },
+    "./package.json": "./package.json"
+  },
   "files": [
-    "dist/src"
+    "dist/src",
+    "ARCHITECTURE.md",
+    "README.md",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "LICENSE"
+  ],
+  "sideEffects": [
+    "./dist/src/cli.js"
   ],
   "engines": {
     "node": ">=20.19.0"
@@ -21,14 +72,20 @@
   "scripts": {
     "build": "tsc",
     "clean": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true });\"",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
     "test": "npm run build && node --test dist/tests/",
     "bench": "npm run build && node tools/benchmark.mjs",
     "plugins:list": "npm run build && node dist/src/cli.js",
-    "plugin:run": "npm run build && node dist/src/cli.js run"
+    "plugin:run": "npm run build && node dist/src/cli.js run",
+    "plugins:validate": "npm run build && node dist/src/cli.js validate"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
-    "typescript": "^5.5.0"
+    "eslint": "^10.12.0",
+    "typescript": "^5.5.0",
+    "typescript-eslint": "^8.71.0"
   },
   "dependencies": {
     "css-select": "^7.0.0",

@@ -2,16 +2,54 @@
  * CLI for StreamPluginEngine.
  *
  * Commands:
- *   node dist/src/cli.js [list] [pluginsDir]
- *   node dist/src/cli.js run <pluginId> <operation> [jsonArgs]
+ *   node dist/src/cli.js [list] [pluginsDir] [--plugins-dir <dir>]
+ *   node dist/src/cli.js run <pluginId> <operation> [jsonArgs] [--plugins-dir <dir>]
+ *   node dist/src/cli.js validate <pluginDir | manifest.json>
+ *
+ * `validate` is developer tooling for plugin authors: it checks a plugin
+ * directory (or a standalone manifest file) with the engine's own
+ * validator and prints the result, so a plugin can be checked before it
+ * is dropped into a plugins directory.
  */
+import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 
+import { ENGINE_API_VERSION, validateManifest } from "./manifest.js";
+import { PluginLoader } from "./loader.js";
 import { PluginManager } from "./manager.js";
 import { PluginRuntime } from "./runtime.js";
 
 const RULE = "─".repeat(24);
+
+/**
+ * Extract `--plugins-dir <dir>` / `--plugins-dir=<dir>` from the
+ * argument list. Unknown flags are left untouched as positionals, so
+ * existing invocations keep working.
+ */
+function extractFlags(args: string[]): {
+  positional: string[];
+  pluginsDir?: string;
+} {
+  const positional: string[] = [];
+  let pluginsDir: string | undefined;
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === undefined) continue;
+    if (arg === "--plugins-dir") {
+      const value = args[i + 1];
+      if (value !== undefined) {
+        pluginsDir = value;
+        i += 1;
+      }
+    } else if (arg.startsWith("--plugins-dir=")) {
+      pluginsDir = arg.slice("--plugins-dir=".length);
+    } else {
+      positional.push(arg);
+    }
+  }
+  return pluginsDir === undefined ? { positional } : { positional, pluginsDir };
+}
 
 async function listPlugins(pluginsDirArg?: string): Promise<void> {
   const pluginsDir = path.resolve(pluginsDirArg ?? "plugins");
@@ -37,6 +75,11 @@ async function listPlugins(pluginsDirArg?: string): Promise<void> {
     console.log(`ID: ${manifest.id}`);
     console.log(`Version: ${manifest.version}`);
     console.log(`Status: ${plugin.status}`);
+    console.log(`Enabled: ${plugin.enabled === false ? "no" : "yes"}`);
+    if (manifest.domains && manifest.domains.length > 0) {
+      // Declared domains are ENFORCED for context.http (v0.2.0).
+      console.log(`Domains (enforced): ${manifest.domains.join(", ")}`);
+    }
     console.log("");
   }
 
@@ -56,6 +99,7 @@ async function runPlugin(
   pluginId: string,
   operation: string,
   argsJson?: string,
+  pluginsDirArg?: string,
 ): Promise<void> {
   let args: unknown[] = [];
   if (argsJson !== undefined) {
@@ -72,7 +116,7 @@ async function runPlugin(
     args = Array.isArray(parsed) ? parsed : [parsed];
   }
 
-  const pluginsDir = path.resolve("plugins");
+  const pluginsDir = path.resolve(pluginsDirArg ?? "plugins");
   const manager = new PluginManager();
   try {
     await manager.discoverPlugins(pluginsDir);
@@ -134,21 +178,115 @@ async function runPlugin(
   runtime.shutdown();
 }
 
+/**
+ * `validate <pluginDir | manifest.json>` — plugin-author tooling.
+ *
+ * Runs the engine's own validator against a plugin directory or a
+ * standalone manifest file and prints a report. Exit code 0 = the plugin
+ * would load; 1 = it would not, with every problem listed.
+ */
+async function validatePlugin(target: string): Promise<void> {
+  const resolved = path.resolve(target);
+  const targetStat = await stat(resolved).catch(() => null);
+
+  console.log("Validate");
+  console.log(RULE);
+  console.log(`Target: ${resolved}`);
+
+  if (!targetStat) {
+    console.error(`Not found: ${resolved}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  // Directory: full plugin check (manifest + entry file), via the same
+  // loader discovery uses.
+  if (targetStat.isDirectory()) {
+    const plugin = await new PluginLoader().loadPlugin(resolved);
+    const manifest = plugin.manifest;
+    if (manifest) {
+      console.log(`ID: ${manifest.id}`);
+      console.log(`Name: ${manifest.name}`);
+      console.log(`Version: ${manifest.version}`);
+      console.log(`Entry: ${manifest.entry}`);
+      console.log(`API version: ${manifest.apiVersion ?? 1}`);
+      console.log(
+        `Domains (enforced): ${
+          manifest.domains && manifest.domains.length > 0
+            ? manifest.domains.join(", ")
+            : "(none — unrestricted by the domain gate)"
+        }`,
+      );
+    }
+    if (plugin.status === "loaded") {
+      console.log(`Status: OK (the engine can load this plugin)`);
+      return;
+    }
+    console.log(`Status: FAILED`);
+    console.log("Problems");
+    console.log(RULE);
+    for (const error of plugin.errors ?? []) console.log(`  - ${error}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  // File: standalone manifest validation.
+  const raw = await readFile(resolved, "utf8").catch(() => null);
+  if (raw === null) {
+    console.error(`Not readable: ${resolved}`);
+    process.exitCode = 1;
+    return;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    console.error("Status: FAILED");
+    console.error(`  - Not valid JSON`);
+    process.exitCode = 1;
+    return;
+  }
+  const result = validateManifest(parsed);
+  if (result.ok) {
+    console.log(`Status: OK (valid manifest, engine API version ${ENGINE_API_VERSION})`);
+    return;
+  }
+  console.log("Status: FAILED");
+  console.log("Problems");
+  console.log(RULE);
+  for (const error of result.errors) console.log(`  - ${error}`);
+  process.exitCode = 1;
+}
+
 async function main(): Promise<void> {
-  const [command, ...rest] = process.argv.slice(2);
+  const { positional, pluginsDir } = extractFlags(process.argv.slice(2));
+  const [command, ...rest] = positional;
 
   if (command === "run") {
     const [pluginId, operation, argsJson] = rest;
     if (!pluginId || !operation) {
-      console.error("Usage: cli run <pluginId> <operation> [jsonArgs]");
+      console.error(
+        "Usage: cli run <pluginId> <operation> [jsonArgs] [--plugins-dir <dir>]",
+      );
       process.exitCode = 1;
       return;
     }
-    await runPlugin(pluginId, operation, argsJson);
+    await runPlugin(pluginId, operation, argsJson, pluginsDir);
     return;
   }
 
-  const listDir = command === "list" ? rest[0] : command;
+  if (command === "validate") {
+    const target = rest[0];
+    if (!target) {
+      console.error("Usage: cli validate <pluginDir | manifest.json>");
+      process.exitCode = 1;
+      return;
+    }
+    await validatePlugin(target);
+    return;
+  }
+
+  const listDir = pluginsDir ?? (command === "list" ? rest[0] : command);
   await listPlugins(listDir);
 }
 

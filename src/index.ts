@@ -12,7 +12,7 @@
  */
 
 export const ENGINE_NAME = "stream-plugin-engine";
-export const ENGINE_VERSION = "0.1.0";
+export const ENGINE_VERSION = "0.2.0";
 /**
  * The engine's PRODUCTION RUNTIME capability level: Phase 6 (normalized
  * source result pipeline) is the last phase that adds runtime behaviour.
@@ -24,7 +24,7 @@ export const ENGINE_VERSION = "0.1.0";
  */
 export const ENGINE_PHASE = 6 as const;
 
-export { validateManifest } from "./manifest.js";
+export { ENGINE_API_VERSION, validateManifest } from "./manifest.js";
 export { MANIFEST_FILE_NAME, PluginLoader } from "./loader.js";
 export { PluginManager } from "./manager.js";
 export { PluginRuntime } from "./runtime.js";
@@ -44,14 +44,20 @@ export type {
   HttpMethod,
   HttpRequestOptions,
   HttpResponse,
+  RequestPolicy,
 } from "./http.js";
 
 export {
   DEFAULT_NETWORK_POLICY,
+  checkDeclaredDomain,
   checkRequestTarget,
   classifyAddress,
+  domainPatternMatches,
   hostFromUrl,
   isAddressAllowed,
+  isHostAllowed,
+  isSubdomainOnlyPattern,
+  normalizeDomainPattern,
 } from "./network.js";
 
 export type {
@@ -106,10 +112,12 @@ export type {
   PluginHttp,
   PluginLoadResult,
   PluginManifest,
+  PluginPermissions,
   PluginRuntimeError,
   PluginRuntimeErrorType,
   PluginRuntimeOptions,
   PluginStatus,
+  ResolvedPluginPermissions,
 } from "./types.js";
 
 export { KNOWN_CAPABILITIES } from "./types.js";

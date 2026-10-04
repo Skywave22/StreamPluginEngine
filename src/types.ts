@@ -19,7 +19,7 @@ import type { PluginHtml, PluginJson } from "./phase5-types.js";
  * A plugin manifest as declared in `<plugin dir>/manifest.json`.
  *
  * Required: id, name, version, entry.
- * Optional: author, description, domains.
+ * Optional: author, description, domains, apiVersion.
  * Unknown fields are rejected by the validator.
  */
 export interface PluginManifest {
@@ -41,9 +41,53 @@ export interface PluginManifest {
   author?: string;
   /** Optional short description. */
   description?: string;
-  /** Optional list of domains this plugin interacts with. */
+  /**
+   * Optional list of domains this plugin interacts with.
+   *
+   * Since v0.2.0 this declaration is ENFORCED, not documentation: when a
+   * plugin declares one or more domains, its `context.http` requests —
+   * including every redirect hop — are limited to those hosts and
+   * anything else fails with `HTTP_DOMAIN_NOT_ALLOWED` before any I/O
+   * (see src/network.ts for the matching semantics). Declaring no
+   * domains leaves the plugin unrestricted by this gate (the engine
+   * network policy still applies). Host applications can turn
+   * enforcement off with `{ http: { enforceManifestDomains: false } }`.
+   */
   domains?: string[];
+  /**
+   * Optional plugin API version this plugin was written against.
+   * Defaults to 1 when absent. A manifest requiring a NEWER API version
+   * than the engine implements is rejected at validation time rather
+   * than failing mysteriously at runtime.
+   */
+  apiVersion?: number;
 }
+
+/**
+ * Per-plugin capability permissions.
+ *
+ * Every capability defaults to ENABLED, so existing plugins are
+ * unaffected. A host application can turn individual capabilities off —
+ * globally (`permissions`) or per plugin (`perPluginPermissions`) — and
+ * a disabled capability is simply ABSENT from the plugin's context
+ * object. The plugin cannot detect or re-enable it, and the engine
+ * exposes no API for a guest to request it.
+ *
+ * `http: false` removes the plugin's entire network surface (making it
+ * pure computation over its arguments), which is the strongest
+ * restriction the engine currently offers.
+ */
+export interface PluginPermissions {
+  /** `context.http` — the controlled network capability. Default true. */
+  http?: boolean;
+  /** `context.json` — bounded JSON parsing/serialization. Default true. */
+  json?: boolean;
+  /** `context.html` — data-only HTML parsing/selection. Default true. */
+  html?: boolean;
+}
+
+/** A permission set with every capability resolved to a boolean. */
+export type ResolvedPluginPermissions = Required<PluginPermissions>;
 
 /**
  * Result of manifest validation. On success the validated manifest is
@@ -70,6 +114,13 @@ export type PluginStatus = "discovered" | "loaded" | "invalid" | "failed";
 export interface Plugin {
   /** Absolute path of the plugin directory (contains manifest.json). */
   pluginPath: string;
+  /**
+   * Whether the plugin is enabled in the engine's registry. Defaults to
+   * true when absent, so callers that build a Plugin by hand keep
+   * working. `PluginManager#setEnabled` is the engine-owned switch, and
+   * the runtime refuses to load a plugin that carries `enabled: false`.
+   */
+  enabled?: boolean;
   /** Validated manifest; present when status is "loaded". */
   manifest?: PluginManifest;
   /**
@@ -168,7 +219,9 @@ export type PluginRuntimeErrorType =
   /** The plugin exceeded the configured memory limit. */
   | "PLUGIN_MEMORY_LIMIT"
   /** The requested capability is not exposed by the plugin. */
-  | "PLUGIN_CAPABILITY_NOT_FOUND";
+  | "PLUGIN_CAPABILITY_NOT_FOUND"
+  /** The plugin is disabled in the engine registry and will not be loaded. */
+  | "PLUGIN_DISABLED";
 
 export interface PluginRuntimeError {
   type: PluginRuntimeErrorType;
@@ -199,6 +252,17 @@ export interface LoadedPlugin {
   readonly manifest: PluginManifest;
   /** Names of the function capabilities detected on the `plugin` export. */
   readonly capabilities: readonly string[];
+  /**
+   * The capabilities this plugin actually received (host decision, see
+   * PluginPermissions). Useful for application-side introspection and
+   * audit: it is never influenced by guest code.
+   */
+  readonly permissions: ResolvedPluginPermissions;
+  /**
+   * The enforced declared-domain allowlist for this plugin (empty =
+   * unrestricted by this gate). Derived from the validated manifest.
+   */
+  readonly allowedDomains: readonly string[];
 }
 
 export interface PluginRuntimeOptions {
@@ -208,6 +272,17 @@ export interface PluginRuntimeOptions {
   memoryLimitBytes?: number;
   /** Receives plugin log lines (default: console with a plugin prefix). */
   logger?: (pluginId: string, message: string) => void;
+  /**
+   * Default capability permissions for every plugin loaded by this
+   * runtime. Per-plugin entries in `perPluginPermissions` override these.
+   */
+  permissions?: PluginPermissions;
+  /**
+   * Capability permissions for specific plugin IDs, overriding
+   * `permissions`. Example:
+   * `{ "untrusted.scraper": { http: false } }`.
+   */
+  perPluginPermissions?: Readonly<Record<string, PluginPermissions>>;
   /**
    * Engine-level limits for the controlled HTTP capability. Values here
    * are ENGINE maximums: plugin-supplied request options are clamped to
@@ -234,5 +309,21 @@ export interface PluginRuntimeOptions {
      * stay offline and deterministic.
      */
     resolver?: AddressResolver;
+    /**
+     * Enforce a plugin's manifest `domains` as an HTTP allowlist.
+     * Default true: a plugin that declares domains can only reach them.
+     * Set false to restore the pre-0.2.0 behaviour where `domains` was
+     * informational only. A plugin with NO declared domains is
+     * unrestricted either way.
+     */
+    enforceManifestDomains?: boolean;
+    /**
+     * Extra domains EVERY plugin may reach, on top of its own declared
+     * domains. This is a HOST decision — e.g. a shared CDN or a fixture
+     * host used by the test suite. It never applies when
+     * `enforceManifestDomains` is false (that setting removes the
+     * allowlist gate entirely) and it cannot be influenced by a plugin.
+     */
+    extraAllowedDomains?: readonly string[];
   };
 }

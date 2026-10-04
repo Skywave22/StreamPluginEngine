@@ -66,14 +66,35 @@ import type {
   LoadedPlugin,
   Plugin,
   PluginLoadResult,
+  PluginPermissions,
   PluginRuntimeError,
   PluginRuntimeErrorType,
   PluginRuntimeOptions,
+  ResolvedPluginPermissions,
 } from "./types.js";
 import type { PluginExecutionResult, PluginManifest } from "./types.js";
 
 const DEFAULT_TIMEOUT_MS = 5000;
 const DEFAULT_MEMORY_LIMIT_BYTES = 64 * 1024 * 1024;
+
+/** Every capability is enabled unless the host application says otherwise. */
+const DEFAULT_PERMISSIONS: ResolvedPluginPermissions = {
+  http: true,
+  json: true,
+  html: true,
+};
+
+/** Resolve a (partial) permission set against the safe default. */
+function resolvePermissions(
+  permissions: PluginPermissions | undefined,
+  base: ResolvedPluginPermissions,
+): ResolvedPluginPermissions {
+  return {
+    http: permissions?.http ?? base.http,
+    json: permissions?.json ?? base.json,
+    html: permissions?.html ?? base.html,
+  };
+}
 
 interface Disposable {
   alive: boolean;
@@ -144,6 +165,18 @@ class LoadedPluginHandle implements LoadedPlugin {
   readonly pluginId: string;
   readonly manifest: PluginManifest;
   readonly capabilities: string[];
+  /**
+   * Capabilities this host actually granted the plugin (see
+   * PluginPermissions). Disabled capabilities are never installed on the
+   * context object, so guest code cannot detect or re-enable them.
+   */
+  readonly permissions: ResolvedPluginPermissions;
+  /**
+   * The enforced declared-domain allowlist (empty = unrestricted by the
+   * gate). Derived from the validated manifest at load time; a plugin
+   * cannot influence it afterwards.
+   */
+  readonly allowedDomains: readonly string[];
   readonly runtime: QuickJSRuntime;
   readonly context: QuickJSContext;
   readonly capabilityFns: Map<string, QuickJSHandle>;
@@ -195,6 +228,8 @@ class LoadedPluginHandle implements LoadedPlugin {
     runtime: QuickJSRuntime,
     context: QuickJSContext,
     capabilityFns: Map<string, QuickJSHandle>,
+    permissions: ResolvedPluginPermissions,
+    allowedDomains: readonly string[],
   ) {
     this.pluginId = manifest.id;
     this.manifest = manifest;
@@ -202,6 +237,8 @@ class LoadedPluginHandle implements LoadedPlugin {
     this.runtime = runtime;
     this.context = context;
     this.capabilityFns = capabilityFns;
+    this.permissions = permissions;
+    this.allowedDomains = allowedDomains;
   }
 
   dispose(): void {
@@ -249,6 +286,16 @@ export class PluginRuntime {
   private readonly logger: (pluginId: string, message: string) => void;
   private readonly httpClient: HttpClient;
   private readonly loaded = new Set<LoadedPluginHandle>();
+  /** Default capability permissions for plugins without an override. */
+  private readonly permissions: ResolvedPluginPermissions;
+  private readonly perPluginPermissions: Readonly<Record<string, PluginPermissions>>;
+  /**
+   * When true (default) a plugin's manifest `domains` are enforced as an
+   * HTTP allowlist for that plugin. Host-level switch only.
+   */
+  private readonly enforceManifestDomains: boolean;
+  /** Host-supplied extra domains every plugin may reach. */
+  private readonly extraAllowedDomains: readonly string[];
 
   constructor(options: PluginRuntimeOptions = {}) {
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -261,6 +308,45 @@ export class PluginRuntime {
       network: options.http?.network,
       resolver: options.http?.resolver,
     });
+    this.permissions = resolvePermissions(options.permissions, DEFAULT_PERMISSIONS);
+    this.perPluginPermissions = options.perPluginPermissions ?? {};
+    this.enforceManifestDomains = options.http?.enforceManifestDomains ?? true;
+    this.extraAllowedDomains = options.http?.extraAllowedDomains ?? [];
+  }
+
+  /**
+   * Resolve the capability permissions for one plugin: the per-plugin
+   * override wins over the runtime default, which wins over "enabled".
+   * Host decision only — nothing here is reachable from guest code.
+   */
+  private permissionsFor(pluginId: string): ResolvedPluginPermissions {
+    const override = this.perPluginPermissions[pluginId];
+    if (override === undefined) {
+      return this.permissions;
+    }
+    return resolvePermissions(override, this.permissions);
+  }
+
+  /**
+   * Resolve the enforced declared-domain allowlist for one plugin.
+   *
+   * Empty means "this gate does not restrict the plugin". The list is
+   * the plugin's manifest `domains` plus the host's
+   * `extraAllowedDomains`; enforcement can be switched off entirely by
+   * the host. Malformed patterns are kept as-is (they simply never
+   * match), so a typo fails closed instead of widening access.
+   */
+  private allowedDomainsFor(manifest: PluginManifest): readonly string[] {
+    const hostExtras = this.extraAllowedDomains.filter(
+      (domain) => domain.trim().length > 0,
+    );
+    if (!this.enforceManifestDomains) {
+      return [];
+    }
+    const declared = (manifest.domains ?? []).filter(
+      (domain) => domain.trim().length > 0,
+    );
+    return [...new Set([...declared, ...hostExtras])];
   }
 
   /**
@@ -284,6 +370,14 @@ export class PluginRuntime {
       return fail({
         type: "PLUGIN_LOAD_ERROR",
         message: "Plugin is not loaded: missing manifest or entry path",
+      });
+    }
+    // Disabled plugins are never evaluated: the engine refuses at the
+    // load boundary so no guest code from a disabled plugin runs at all.
+    if (plugin.enabled === false) {
+      return fail({
+        type: "PLUGIN_DISABLED",
+        message: `Plugin '${plugin.manifest.id}' is disabled and will not be loaded`,
       });
     }
     const { manifest, entryPath } = plugin;
@@ -416,6 +510,8 @@ export class PluginRuntime {
         runtime,
         context,
         capabilityFns,
+        this.permissionsFor(manifest.id),
+        this.allowedDomainsFor(manifest),
       );
       this.loaded.add(handle);
       return { ok: true, plugin: handle, loadTimeMs: loadTimeMs() };
@@ -842,75 +938,85 @@ export class PluginRuntime {
     });
     track(logFn, tracked);
 
-    // context.http — the ONLY network surface a plugin has.
-    const httpObject = track(context.newObject(), tracked);
-    const getFn = track(
-      context.newFunction("get", (...callArgs: QuickJSHandle[]) =>
-        this.startHttpCall(handle, "get", callArgs, opAbort, tracked),
-      ),
-      tracked,
-    );
-    const getJsonFn = track(
-      context.newFunction("getJson", (...callArgs: QuickJSHandle[]) =>
-        this.startHttpCall(handle, "getJson", callArgs, opAbort, tracked),
-      ),
-      tracked,
-    );
-    const requestFn = track(
-      context.newFunction("request", (...callArgs: QuickJSHandle[]) =>
-        this.startHttpCall(handle, "request", callArgs, opAbort, tracked),
-      ),
-      tracked,
-    );
-    context.setProp(httpObject, "get", getFn);
-    context.setProp(httpObject, "getJson", getJsonFn);
-    context.setProp(httpObject, "request", requestFn);
+    context.setProp(contextObject, "manifest", manifestHandle);
+    context.setProp(contextObject, "log", logFn);
+
+    // context.http — the ONLY network surface a plugin has. Absent
+    // entirely when the host disabled the http capability: a disabled
+    // capability is not "a function that throws", it does not exist.
+    if (handle.permissions.http) {
+      const httpObject = track(context.newObject(), tracked);
+      const getFn = track(
+        context.newFunction("get", (...callArgs: QuickJSHandle[]) =>
+          this.startHttpCall(handle, "get", callArgs, opAbort, tracked),
+        ),
+        tracked,
+      );
+      const getJsonFn = track(
+        context.newFunction("getJson", (...callArgs: QuickJSHandle[]) =>
+          this.startHttpCall(handle, "getJson", callArgs, opAbort, tracked),
+        ),
+        tracked,
+      );
+      const requestFn = track(
+        context.newFunction("request", (...callArgs: QuickJSHandle[]) =>
+          this.startHttpCall(handle, "request", callArgs, opAbort, tracked),
+        ),
+        tracked,
+      );
+      context.setProp(httpObject, "get", getFn);
+      context.setProp(httpObject, "getJson", getJsonFn);
+      context.setProp(httpObject, "request", requestFn);
+      context.setProp(contextObject, "http", httpObject);
+    }
 
     // context.json — Phase 5. The implementation is a STATIC guest-side
     // source (no plugin data, no host identifiers) wrapping the guest's
     // native JSON. It throws structured { code, message } objects on
     // failure. No value crosses the Wasm boundary for JSON work.
-    const jsonEvalResult = track(
-      context.evalCode(PHASE5_JSON_GUEST_SOURCE, "phase5-json", {
-        type: "global",
-      }),
-      tracked,
-    );
-    const jsonObject = context.unwrapResult(jsonEvalResult);
-    track(jsonObject, tracked);
+    // Not evaluated at all when the capability is disabled.
+    if (handle.permissions.json) {
+      const jsonEvalResult = track(
+        context.evalCode(PHASE5_JSON_GUEST_SOURCE, "phase5-json", {
+          type: "global",
+        }),
+        tracked,
+      );
+      const jsonObject = context.unwrapResult(jsonEvalResult);
+      track(jsonObject, tracked);
+      context.setProp(contextObject, "json", jsonObject);
+    }
 
     // context.html — Phase 5. Host-bridged synchronous functions: the
     // work (parse/select/serialize) happens host-side in src/phase5.ts
     // and the result crosses back as plain JSON. Failures return a
     // rejected promise carrying a structured { code, message } object.
-    const htmlObject = track(context.newObject(), tracked);
-    const htmlParseFn = track(
-      context.newFunction("parse", (...args: QuickJSHandle[]) =>
-        this.phase5Parse(handle, args[0], tracked),
-      ),
-      tracked,
-    );
-    const htmlSelectFn = track(
-      context.newFunction("select", (...args: QuickJSHandle[]) =>
-        this.phase5Select(handle, args[0], args[1], tracked),
-      ),
-      tracked,
-    );
-    const htmlExtractFn = track(
-      context.newFunction("extract", (...args: QuickJSHandle[]) =>
-        this.phase5Extract(handle, args[0], tracked),
-      ),
-      tracked,
-    );
-    context.setProp(htmlObject, "parse", htmlParseFn);
-    context.setProp(htmlObject, "select", htmlSelectFn);
-    context.setProp(htmlObject, "extract", htmlExtractFn);
+    if (handle.permissions.html) {
+      const htmlObject = track(context.newObject(), tracked);
+      const htmlParseFn = track(
+        context.newFunction("parse", (...args: QuickJSHandle[]) =>
+          this.phase5Parse(handle, args[0], tracked),
+        ),
+        tracked,
+      );
+      const htmlSelectFn = track(
+        context.newFunction("select", (...args: QuickJSHandle[]) =>
+          this.phase5Select(handle, args[0], args[1], tracked),
+        ),
+        tracked,
+      );
+      const htmlExtractFn = track(
+        context.newFunction("extract", (...args: QuickJSHandle[]) =>
+          this.phase5Extract(handle, args[0], tracked),
+        ),
+        tracked,
+      );
+      context.setProp(htmlObject, "parse", htmlParseFn);
+      context.setProp(htmlObject, "select", htmlSelectFn);
+      context.setProp(htmlObject, "extract", htmlExtractFn);
+      context.setProp(contextObject, "html", htmlObject);
+    }
 
-    context.setProp(contextObject, "manifest", manifestHandle);
-    context.setProp(contextObject, "log", logFn);
-    context.setProp(contextObject, "http", httpObject);
-    context.setProp(contextObject, "json", jsonObject);
-    context.setProp(contextObject, "html", htmlObject);
     return contextObject;
   }
 
@@ -1225,7 +1331,15 @@ export class PluginRuntime {
     };
 
     try {
-      const response = await this.httpClient.request(request.url, request.options, signal);
+      // The declared-domain allowlist is enforced inside the client on
+      // every hop, so a redirect cannot leave the plugin's declared
+      // surface (HTTP_DOMAIN_NOT_ALLOWED before any I/O).
+      const response = await this.httpClient.request(
+        request.url,
+        request.options,
+        signal,
+        { allowedDomains: handle.allowedDomains },
+      );
       if (operation === "getJson") {
         try {
           payload = JSON.parse(response.body) as unknown;

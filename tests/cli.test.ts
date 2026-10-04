@@ -298,3 +298,104 @@ test("cli: async capabilities complete and the process exits cleanly", async (t)
   // No leaked handles should keep the process alive or emit warnings.
   assert.ok(!/MaxListeners|Warning|unhandled/i.test(res.stderr), res.stderr);
 });
+
+// ---------------------------------------------------------------------------
+// validate (plugin-author tooling, v0.2.0)
+// ---------------------------------------------------------------------------
+
+test("cli: validate accepts a good plugin directory and reports its domains", async (t) => {
+  const base = await fixture(t, "echo", ECHO_MANIFEST, ECHO_SOURCE);
+  const dir = path.join(base, "plugins", "echo");
+  const res = await runCli(["validate", dir]);
+  assert.equal(res.code, 0, `stderr: ${res.stderr}`);
+  assert.match(res.stdout, /Status: OK/);
+  assert.match(res.stdout, /ID: t\.echo/);
+  assert.match(res.stdout, /Version: 1\.0\.0/);
+  assert.match(res.stdout, /API version: 1/);
+  assert.match(res.stdout, /\(none — unrestricted by the domain gate\)/);
+});
+
+test("cli: validate lists every problem of a broken plugin and exits 1", async (t) => {
+  const base = await temp(t);
+  const dir = path.join(base, "broken");
+  await mkdir(dir, { recursive: true });
+  await writeFile(
+    path.join(dir, "manifest.json"),
+    JSON.stringify({ id: "Broken ID", name: "", version: "1", entry: "../x.js" }),
+  );
+  const res = await runCli(["validate", dir]);
+  assert.equal(res.code, 1);
+  assert.match(res.stdout, /Status: FAILED/);
+  assert.match(res.stdout, /Problems/);
+  // All independent problems are reported in one pass.
+  assert.match(res.stdout, /'id'/);
+  assert.match(res.stdout, /'version'/);
+  assert.match(res.stdout, /path traversal/);
+});
+
+test("cli: validate checks a manifest file and a future apiVersion", async (t) => {
+  const base = await temp(t);
+  const goodPath = path.join(base, "manifest.json");
+  await writeFile(
+    goodPath,
+    JSON.stringify({
+      id: "t.file",
+      name: "File",
+      version: "1.0.0",
+      entry: "plugin.js",
+      apiVersion: 1,
+    }),
+  );
+  const good = await runCli(["validate", goodPath]);
+  assert.equal(good.code, 0, `stderr: ${good.stderr}`);
+  assert.match(good.stdout, /Status: OK/);
+
+  const badPath = path.join(base, "future.json");
+  await writeFile(
+    badPath,
+    JSON.stringify({
+      id: "t.future",
+      name: "Future",
+      version: "1.0.0",
+      entry: "plugin.js",
+      apiVersion: 99,
+    }),
+  );
+  const bad = await runCli(["validate", badPath]);
+  assert.equal(bad.code, 1);
+  assert.match(bad.stdout, /apiVersion.*not supported/i);
+});
+
+test("cli: validate reports a missing target and missing arguments", async (t) => {
+  const base = await temp(t);
+  const missing = await runCli(["validate", path.join(base, "nope")]);
+  assert.equal(missing.code, 1);
+  assert.match(missing.stderr, /Not found:/);
+
+  const noArg = await runCli(["validate"]);
+  assert.equal(noArg.code, 1);
+  assert.match(noArg.stderr, /Usage: cli validate/);
+});
+
+// ---------------------------------------------------------------------------
+// --plugins-dir (v0.2.0)
+// ---------------------------------------------------------------------------
+
+test("cli: --plugins-dir selects the registry for list and run", async (t) => {
+  const base = await fixture(t, "echo", ECHO_MANIFEST, ECHO_SOURCE);
+  const elsewhere = await temp(t);
+  const pluginsDir = path.join(base, "plugins");
+
+  // From an unrelated cwd, both commands work off the explicit directory.
+  const list = await runCli(["list", "--plugins-dir", pluginsDir], elsewhere);
+  assert.equal(list.code, 0, `stderr: ${list.stderr}`);
+  assert.match(list.stdout, /Echo Fixture/);
+  assert.match(list.stdout, /Enabled: yes/);
+
+  const run = await runCli(
+    ["run", "t.echo", "echo", '["flag-ok"]', `--plugins-dir=${pluginsDir}`],
+    elsewhere,
+  );
+  assert.equal(run.code, 0, `stderr: ${run.stderr}`);
+  assert.match(run.stdout, /Result: \{"echoed":"flag-ok"\}/);
+});

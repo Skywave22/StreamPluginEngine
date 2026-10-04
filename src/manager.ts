@@ -12,14 +12,22 @@ import type { Plugin } from "./types.js";
  * - load valid plugin manifests (metadata only — no code execution)
  * - prevent duplicate plugin IDs
  * - retrieve, list, and unregister plugins
+ * - track engine-level enable/disable state per plugin (v0.2.0)
  *
  * Each call to discoverPlugins() rebuilds the registry from the given
- * directory. Filesystem installation/removal of plugins is out of scope
- * for this phase, and the manager contains no HTTP or runtime logic.
+ * directory; the enable/disable state is owned by this registry and
+ * survives rediscovery (a plugin disabled before a rescan is still
+ * disabled after it). The runtime refuses to load a disabled plugin, so
+ * "disabled" means no plugin code runs — not merely "hidden".
+ *
+ * The manager contains no HTTP or runtime logic, and the state is
+ * in-memory only: persistence is an application concern.
  */
 export class PluginManager {
   private readonly loader = new PluginLoader();
   private readonly pluginsById = new Map<string, Plugin>();
+  /** IDs disabled by the host application. Source of truth. */
+  private readonly disabledIds = new Set<string>();
   private problems: Plugin[] = [];
 
   /**
@@ -72,6 +80,7 @@ export class PluginManager {
             ],
           });
         } else {
+          plugin.enabled = !this.disabledIds.has(id);
           this.pluginsById.set(id, plugin);
         }
       } else {
@@ -94,10 +103,62 @@ export class PluginManager {
 
   /**
    * Removes a plugin from the in-memory registry (no filesystem change).
-   * Returns true if a plugin with the given ID was registered.
+   * Returns true if a plugin with the given ID was registered. Also
+   * clears any enable/disable state for that ID.
    */
   unregister(id: string): boolean {
+    this.disabledIds.delete(id);
     return this.pluginsById.delete(id);
+  }
+
+  /**
+   * Enables or disables a registered plugin. Returns false when no
+   * plugin with that ID is registered (nothing to toggle).
+   *
+   * The state is engine-owned and survives rediscovery; the runtime
+   * refuses to load a disabled plugin, so no plugin code executes while
+   * it is disabled. Re-enabling only flips the flag — the plugin is
+   * loaded lazily by the normal load path, never automatically here.
+   */
+  setEnabled(id: string, enabled: boolean): boolean {
+    const plugin = this.pluginsById.get(id);
+    if (!plugin) {
+      return false;
+    }
+    if (enabled) {
+      this.disabledIds.delete(id);
+    } else {
+      this.disabledIds.add(id);
+    }
+    plugin.enabled = enabled;
+    return true;
+  }
+
+  /** Convenience wrapper for `setEnabled(id, true)`. */
+  enable(id: string): boolean {
+    return this.setEnabled(id, true);
+  }
+
+  /** Convenience wrapper for `setEnabled(id, false)`. */
+  disable(id: string): boolean {
+    return this.setEnabled(id, false);
+  }
+
+  /**
+   * Whether a registered plugin is enabled. Unregistered IDs report
+   * false, matching "no plugin, nothing to run".
+   */
+  isEnabled(id: string): boolean {
+    const plugin = this.pluginsById.get(id);
+    if (!plugin) {
+      return false;
+    }
+    return plugin.enabled !== false;
+  }
+
+  /** IDs currently disabled in this registry. */
+  listDisabledIds(): string[] {
+    return [...this.disabledIds].sort();
   }
 
   /** Plugins that were discovered but could not be loaded. */

@@ -309,3 +309,139 @@ export async function checkRequestTarget(
   }
   return { allowed: true };
 }
+
+// ---------------------------------------------------------------------------
+// Declared-domain allowlist (manifest `domains`, enforced)
+// ---------------------------------------------------------------------------
+
+/**
+ * A plugin's manifest may DECLARE the domains it interacts with
+ * (`domains: ["example.com"]`). Since v0.2.0 the engine ENFORCES that
+ * declaration for the controlled HTTP capability: when a plugin declares
+ * one or more domains, its requests (including every redirect hop) are
+ * limited to those hosts and anything else fails with the structured code
+ * `HTTP_DOMAIN_NOT_ALLOWED` before any I/O.
+ *
+ * This is a second, independent gate that sits in front of the network
+ * policy in src/http.ts:
+ *
+ *   - the NETWORK policy answers "is this address reachable at all?"
+ *     (public-internet-only by default; blocks SSRF targets);
+ *   - the DECLARED-DOMAIN allowlist answers "is this host within the
+ *     surface this plugin told the user about?".
+ *
+ * Enforcement is fail-closed. A mistyped or malformed pattern never
+ * matches anything, so it can never silently widen a plugin's reach.
+ *
+ * Backward compatible by design: a plugin that declares NO domains is
+ * unrestricted by this gate (the network policy still applies), exactly
+ * as before, and a host application can disable enforcement entirely with
+ * `{ http: { enforceManifestDomains: false } }`.
+ *
+ * Pattern semantics (documented, deterministic):
+ *
+ *   | pattern          | matches                                  |
+ *   | ---------------- | ---------------------------------------- |
+ *   | `example.com`    | `example.com` AND `*.example.com`        |
+ *   | `*.example.com`  | subdomains only, NOT the apex            |
+ *   | `.example.com`   | same as `*.example.com`                  |
+ *   | `EXAMPLE.com.`   | canonicalised to `example.com` (IDN → punycode too) |
+ *
+ * Matching is exact-label: `evil-example.com` and `notexample.com` do
+ * NOT match `example.com`, because a suffix check is anchored at a label
+ * boundary (`.`).
+ */
+
+/**
+ * Canonicalise a domain pattern (or `null` when it is not usable).
+ *
+ * Lowercases, strips a leading `*.`/`.`, strips one trailing dot, and
+ * runs the result through the WHATWG URL parser so IDN labels become
+ * punycode exactly like the hostname of a request URL.
+ */
+export function normalizeDomainPattern(pattern: string): string | null {
+  const trimmed = pattern.trim().toLowerCase();
+  if (trimmed.length === 0) return null;
+  const body = trimmed.startsWith("*.")
+    ? trimmed.slice(2)
+    : trimmed.startsWith(".")
+      ? trimmed.slice(1)
+      : trimmed;
+  if (body.length === 0 || body.includes("/") || /\s/.test(body)) return null;
+  const bare = body.endsWith(".") ? body.slice(0, -1) : body;
+  if (bare.length === 0) return null;
+  try {
+    const host = new URL(`http://${bare}`).hostname;
+    return host.length > 0 ? host : null;
+  } catch {
+    return null;
+  }
+}
+
+/** True when `pattern` only matches subdomains (leading `*.` / `.`). */
+export function isSubdomainOnlyPattern(pattern: string): boolean {
+  const trimmed = pattern.trim();
+  return trimmed.startsWith("*.") || trimmed.startsWith(".");
+}
+
+/**
+ * True when `host` matches `pattern` under the documented semantics.
+ * Invalid patterns never match (fail closed).
+ */
+export function domainPatternMatches(host: string, pattern: string): boolean {
+  const canonical = normalizeDomainPattern(pattern);
+  if (canonical === null) return false;
+  const normalizedHost = host.toLowerCase().replace(/\.$/, "");
+  if (normalizedHost === canonical) {
+    // A wildcard pattern does not cover the apex itself.
+    return !isSubdomainOnlyPattern(pattern);
+  }
+  return normalizedHost.endsWith(`.${canonical}`);
+}
+
+/**
+ * True when `host` matches any of `allowedDomains`.
+ * An EMPTY list means "no declared domains" → not restricted.
+ */
+export function isHostAllowed(
+  host: string,
+  allowedDomains: readonly string[],
+): boolean {
+  if (allowedDomains.length === 0) return true;
+  return allowedDomains.some((pattern) => domainPatternMatches(host, pattern));
+}
+
+/**
+ * Decide whether `url` is within a plugin's declared domains.
+ *
+ * Mirrors `checkRequestTarget`: returns a structured decision and is
+ * called for the initial URL and every redirect hop. The allowlist is
+ * checked BEFORE any I/O (and before DNS), so a disallowed host costs
+ * nothing and never touches the network.
+ *
+ * @param allowedDomains The plugin's effective allowlist. Empty = no
+ *   restriction from this gate.
+ */
+export function checkDeclaredDomain(
+  url: URL,
+  allowedDomains: readonly string[],
+): NetworkDecision {
+  if (allowedDomains.length === 0) {
+    return { allowed: true };
+  }
+  const host = hostFromUrl(url);
+  if (isHostAllowed(host, allowedDomains)) {
+    return { allowed: true };
+  }
+  const declared = allowedDomains
+    .map((pattern) => pattern.trim())
+    .filter((pattern) => pattern.length > 0)
+    .join(", ");
+  return {
+    allowed: false,
+    code: "HTTP_DOMAIN_NOT_ALLOWED",
+    message: `Requests to '${host}' are not allowed: the plugin's manifest declares ${
+      declared.length > 0 ? `domains: ${declared}` : "no usable domains"
+    }`,
+  };
+}

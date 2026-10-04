@@ -32,6 +32,12 @@
 // structured source results (Phase 6 contract) — the app layer passes
 // them through the engine's normalizeSourceResults() for trusted,
 // normalized output.
+//
+// This plugin's manifest declares `domains: ["example.com"]` and
+// `apiVersion: 1`. Since v0.2.0 the declared domains are ENFORCED:
+// context.http requests from this plugin — including every redirect
+// hop — may only reach example.com and its subdomains. Anything else
+// fails with the structured code {code: "HTTP_DOMAIN_NOT_ALLOWED"}.
 
 export const plugin = {
   /** Harmless self-test used by the CLI and test suite. */

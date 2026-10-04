@@ -2,12 +2,31 @@
 
 Lightweight, cross-platform plugin engine for a future media/streaming application. This repository contains the **engine only** — no UI, browser automation, or media-player application.
 
-## Current status: Phases 1–6 complete + Phase 7 validation tooling
+## Current status: v0.2.0 — Phases 1–6 complete + Phase 7 validation tooling
 
 **Phases 1–6 are the production runtime and are complete.** Phase 7 is
 final validation and developer-only tooling (security regression, CLI
 end-to-end, and lifecycle/concurrency tests plus a benchmark harness); it
-adds no runtime capability. See the roadmap in `ARCHITECTURE.md`.
+adds no runtime capability. `ENGINE_PHASE` therefore stays **6**;
+`ENGINE_VERSION` is **0.2.0**. See the roadmap in `ARCHITECTURE.md`.
+
+**v0.2.0 makes the engine enforce what a manifest declares.** A review of
+0.1.0 found that `domains` was validated and stored but never read — a
+manifest field that promised a restriction the engine did not apply — and
+that every plugin automatically received every capability. Both are fixed:
+
+- **Declared domains are an enforced allowlist** for `context.http`
+  (including every redirect hop) — undeclared hosts fail with
+  `HTTP_DOMAIN_NOT_ALLOWED` before any I/O.
+- **Capability permissions** let the host grant `http`, `json`, and `html`
+  per plugin; a disabled capability is absent from the context object.
+- **`apiVersion`** in a manifest is checked against the engine's
+  `ENGINE_API_VERSION`, so an incompatible plugin fails at validation
+  instead of at runtime.
+- **Engine-owned enable/disable** (`PluginManager`) — a disabled plugin is
+  never loaded, so none of its code runs.
+- Plus `cli validate`, a `--plugins-dir` flag, an `exports` map, ESLint,
+  CI (Linux + Windows + macOS), `SECURITY.md`, and `CONTRIBUTING.md`.
 
 An independent audit of the source, tests, and Git history found and fixed
 four real defects in the Phase 1–6 layers — a missing network/SSRF policy,
@@ -119,10 +138,13 @@ Requires Node.js >= 20.19 (the HTML parsing stack declares `>=20.19`).
 ```bash
 npm install
 npm run build
-npm test
+npm test                                     # 246 tests, offline, deterministic
+npm run typecheck                            # tsc --noEmit (strict)
+npm run lint                                 # ESLint (type-aware)
 npm run plugins:list
 npm run plugin:run -- example.source test
-npm run bench          # optional: developer-only benchmark harness
+npm run plugins:validate -- plugins/example  # plugin-author check
+npm run bench                                # optional: developer-only benchmark harness
 ```
 
 `npm test` builds the TypeScript project first and then runs the built-in Node.js test runner.
@@ -130,16 +152,35 @@ npm run bench          # optional: developer-only benchmark harness
 ## Project layout
 
 ```text
-src/        Engine source (production runtime — Phases 1-6)
-tests/      Tests (correctness suite, run by `npm test`)
-tools/      Developer-only tooling (benchmark harness — Phase 7)
-plugins/    Example plugin
-dist/       Build output (generated, not committed)
+src/            Engine source (production runtime — Phases 1-6)
+tests/          Tests (correctness suite, run by `npm test`)
+tools/          Developer-only tooling (benchmark harness — Phase 7)
+plugins/        Example plugin
+.github/        CI (typecheck + lint + tests on Linux/Windows/macOS)
+dist/           Build output (generated, not committed)
 ```
 
 ## Writing a plugin
 
 A plugin is a directory inside `plugins/` with `manifest.json` and an ES-module entry file.
+
+```json
+{
+  "id": "example.source",
+  "name": "Example Source",
+  "version": "1.0.0",
+  "entry": "plugin.js",
+  "apiVersion": 1,
+  "domains": ["example.com"]
+}
+```
+
+`domains` is **enforced** (v0.2.0): this plugin's `context.http` calls may
+only reach `example.com` and its subdomains — see
+[Enforced declared domains](#enforced-declared-domains-v020). `apiVersion`
+declares the plugin contract revision the plugin was written against and is
+checked against `ENGINE_API_VERSION` (currently `1`). Both fields are
+optional; a plugin without `domains` is unrestricted by that gate.
 
 ```js
 export const plugin = {
@@ -180,6 +221,48 @@ Plugins do not get direct access to:
 The sanctioned network surface is `context.http`. HTML parsing and JSON parsing do not add direct network or filesystem access.
 
 Execution is bounded by the existing runtime time and memory limits. This is engine-level isolation, not an OS-level security boundary.
+
+## Capability permissions (v0.2.0)
+
+By default a plugin receives `manifest`, `log`, `http`, `json`, and `html`
+— unchanged from 0.1.0. A host application can grant less, either as a
+runtime-wide default or per plugin:
+
+```js
+const runtime = new PluginRuntime({
+  // Default for every plugin loaded by this runtime.
+  permissions: { html: false },
+  // Per-plugin override (wins over the default).
+  perPluginPermissions: {
+    "untrusted.scraper": { http: false, html: true },
+  },
+});
+```
+
+`http: false` removes the plugin's entire network surface — it becomes
+pure computation over its arguments, which is the strongest restriction the
+engine currently offers.
+
+A disabled capability is **absent from the context object**, not a function
+that throws:
+
+```js
+// With permissions: { http: false }
+typeof context.http; // "undefined"
+"http" in context;   // false
+```
+
+There is no API through which a guest can detect, request, or re-enable a
+disabled capability. The granted set is visible host-side for audit and
+introspection:
+
+```js
+const result = await runtime.loadPlugin(plugin);
+if (result.ok) {
+  result.plugin.permissions;    // { http: true, json: true, html: true }
+  result.plugin.allowedDomains; // ["example.com"] — enforced allowlist
+}
+```
 
 ## HTTP capability (Phase 4)
 
@@ -225,6 +308,42 @@ const runtime = new PluginRuntime({
 Residual risk, stated plainly: the policy resolves DNS to decide and the request resolves DNS again to connect, so a hostile authoritative server can still rebind between the two. Fully closing that needs connection-level address pinning. Deployments running untrusted plugins should also apply OS/network-level egress controls — this is engine-level defence in depth, not an OS boundary.
 
 The HTTP layer does **not** provide browser automation, CAPTCHA solving, Cloudflare bypass, DRM bypass, authentication bypass, or other security-control circumvention.
+
+### Enforced declared domains (v0.2.0)
+
+The network policy answers *"is this address reachable at all?"*. The
+manifest's `domains` answers a different question — *"is this host inside
+the surface the plugin told the user about?"* — and since v0.2.0 the engine
+enforces it:
+
+```json
+{ "domains": ["example.com", "*.cdn.example"] }
+```
+
+- Requests to hosts **outside** the declaration fail with the structured
+  code `HTTP_DOMAIN_NOT_ALLOWED`, **before any I/O** (no DNS lookup, no
+  connection).
+- The check runs on the initial URL **and on every redirect hop**, so a
+  redirect cannot leave the declared surface.
+- Matching is exact-label: a bare domain covers the apex and subdomains
+  (`example.com` matches `cdn.example.com`), `*.example.com` covers
+  subdomains only, matching is case- and trailing-dot-insensitive, IDN
+  patterns are canonicalised to punycode, and `allowed.example.evil.test`
+  does **not** match `allowed.example`. Malformed patterns fail closed.
+- A plugin that declares **no** domains is unrestricted by this gate —
+  0.1.0 behaviour, unchanged.
+- The host can widen every plugin with `extraAllowedDomains` (e.g. a shared
+  fixture host) or switch the gate off entirely with
+  `enforceManifestDomains: false`. Both are host-only decisions:
+
+```js
+const runtime = new PluginRuntime({
+  http: {
+    enforceManifestDomains: true,          // default
+    extraAllowedDomains: ["cdn.example"],  // host decision, applies to all plugins
+  },
+});
+```
 
 HTTP tests use a local test server and do not depend on the public Internet.
 
@@ -402,6 +521,42 @@ array).
 All limits are engine constants (`RESULT_LIMITS`); plugins cannot raise
 them.
 
+## Plugin lifecycle: enable/disable (v0.2.0)
+
+The registry — not the application — can now own the on/off state:
+
+```js
+manager.disable("example.source"); // no plugin code runs while disabled
+manager.enable("example.source");
+manager.isEnabled("example.source");
+manager.listDisabledIds();
+manager.getPlugin("example.source")?.enabled; // false
+```
+
+Disabling is enforced at the load boundary: `runtime.loadPlugin()` returns
+a structured `PLUGIN_DISABLED` error and **none of the plugin's code is
+evaluated**. The state survives `discoverPlugins()` (a rescan does not
+silently re-enable a plugin), and `unregister()` clears it. Persistence is
+an application concern.
+
+## CLI
+
+```bash
+node dist/src/cli.js [list] [pluginsDir] [--plugins-dir <dir>]
+node dist/src/cli.js run <pluginId> <operation> [jsonArgs] [--plugins-dir <dir>]
+node dist/src/cli.js validate <pluginDir | manifest.json>
+```
+
+- `list` prints each plugin's ID, version, status, enabled state, and its
+  enforced domains, then reports any plugin that failed to load.
+- `run` executes one capability with JSON arguments.
+- `validate` (v0.2.0) is plugin-author tooling: it runs the engine's own
+  validator against a plugin directory (manifest **and** entry file) or a
+  standalone manifest file and prints every problem, exiting `1` if the
+  plugin would not load.
+- `--plugins-dir` makes `list` and `run` independent of the current working
+  directory.
+
 ## Dependencies
 
 The dependency set is intentionally small (plus transitive packages of the HTML parser):
@@ -466,10 +621,30 @@ found:
   runs in a **child process with a hard timeout**, so if the interrupt-handler
   race ever returns the test fails cleanly instead of freezing the suite.
 
+v0.2.0 adds the enforcement layer:
+
+- **capability permissions** (`tests/permissions.test.ts`) — the default
+  context surface, removing `http`/`json`/`html` individually, per-plugin
+  overrides, and the introspection fields
+- **enforced declared domains** — pattern semantics (apex/subdomain,
+  wildcard, IDN, label anchoring, malformed-pattern fail-closed), matching
+  through the guest HTTP capability with a **mocked `fetch`** proving a
+  blocked host is never contacted, redirect-hop enforcement, the
+  no-domains backward-compatibility case, and the host switches
+  (`enforceManifestDomains`, `extraAllowedDomains`)
+- **enable/disable** — the runtime refusing to load a disabled plugin
+  (`PLUGIN_DISABLED`), re-enable, and state surviving rediscovery
+- **`apiVersion`** — acceptance, preservation, and loud rejection of a
+  version the engine does not implement
+- **CLI** — `validate` (good plugin, broken plugin reporting every problem,
+  manifest file, missing path) and `--plugins-dir` for `list`/`run`
+
 Run:
 
 ```bash
-npm test        # correctness suite (225 tests, offline, deterministic)
+npm test        # correctness suite (246 tests, offline, deterministic)
+npm run typecheck
+npm run lint
 npm run bench   # developer-only benchmarks — NOT part of the test suite
 ```
 
@@ -481,6 +656,10 @@ engine consumers.
 ## Documentation
 
 - `ARCHITECTURE.md` — overall engine architecture and phase boundaries.
+- `SECURITY.md` — threat model, non-goals, and hardening guidance.
+- `CONTRIBUTING.md` — development workflow and rules for maintainers.
+- `CHANGELOG.md` — release notes and the plugin-contract revision
+  (`ENGINE_API_VERSION`).
 
 ## Explicitly out of scope
 
@@ -507,12 +686,17 @@ The engine (Phases 1–6) is **not** a media/stream extractor. It does not imple
 
 ## Rules for maintainers
 
-The project is complete: Phases 1–6 are the production runtime, and Phase 7
-is developer-only validation tooling. For any future maintenance work:
+Phases 1–6 are the production runtime and Phase 7 is developer-only
+validation tooling; v0.2.0 adds enforcement, not a new phase. For any
+future maintenance work:
 
 1. Inspect the repository before modifying it.
-2. Run `npm test` before declaring a change complete.
+2. Run `npm run typecheck && npm run lint && npm test` before declaring a
+   change complete (CI enforces the same on Linux, Windows, and macOS).
 3. Keep changes small and understandable.
 4. Do not add new phases or new capabilities without an explicit project
-   decision.
+   decision. Anything that changes the plugin contract incompatible-ly must
+   bump `ENGINE_API_VERSION`.
 5. Never commit secrets, tokens, or credentials.
+
+See `CONTRIBUTING.md` for the full workflow.

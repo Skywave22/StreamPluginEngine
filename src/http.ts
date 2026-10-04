@@ -29,6 +29,7 @@
  */
 import {
   DEFAULT_NETWORK_POLICY,
+  checkDeclaredDomain,
   checkRequestTarget,
   systemResolver,
 } from "./network.js";
@@ -73,6 +74,7 @@ export const HTTP_ERROR_CODES = [
   "HTTP_INVALID_URL",
   "HTTP_UNSUPPORTED_SCHEME",
   "HTTP_FORBIDDEN_TARGET",
+  "HTTP_DOMAIN_NOT_ALLOWED",
   "HTTP_TIMEOUT",
   "HTTP_ABORTED",
   "HTTP_NETWORK_ERROR",
@@ -172,6 +174,23 @@ interface EffectiveRequest {
   maxRedirects: number;
 }
 
+/**
+ * Per-CALL request policy supplied by the caller (the runtime) on top of
+ * the engine-wide limits/config.
+ *
+ * This is where a plugin's manifest-declared `domains` become an
+ * enforced allowlist: when `allowedDomains` is non-empty, every hop of
+ * the request must match one of the patterns or the request fails with
+ * `HTTP_DOMAIN_NOT_ALLOWED` before any I/O (see src/network.ts for the
+ * matching semantics). An empty list means "not restricted by this gate".
+ *
+ * A plugin never constructs this: it is derived host-side from the
+ * validated manifest, so guest code cannot widen its own reach.
+ */
+export interface RequestPolicy {
+  allowedDomains?: readonly string[];
+}
+
 /** Why the request's AbortController was fired (null = still running). */
 interface AbortState {
   reason: "timeout" | "too-large" | "external" | null;
@@ -210,11 +229,14 @@ export class HttpClient {
    * @param options Controlled request options (all optional).
    * @param externalSignal Optional engine-side cancellation (e.g. the
    *   plugin's operation ending). Aborts map to HTTP_ABORTED.
+   * @param policy Optional per-call policy derived from the plugin's
+   *   manifest (declared-domain allowlist). Absent = unrestricted.
    */
   async request(
     url: string,
     options: HttpRequestOptions = {},
     externalSignal?: AbortSignal,
+    policy?: RequestPolicy,
   ): Promise<HttpResponse> {
     const effective = this.resolveOptions(options);
     const startUrl = validateUrl(url, this.limits.maxUrlLength);
@@ -257,6 +279,19 @@ export class HttpClient {
             "HTTP_TIMEOUT",
             `HTTP request timed out after ${effective.timeoutMs} ms`,
           );
+        }
+
+        // Declared-domain gate: the plugin's manifest `domains` are an
+        // enforced allowlist when enforcement is on and the plugin
+        // declared any. Checked BEFORE DNS/any I/O, and re-checked on
+        // every hop so a redirect cannot leave the declared surface.
+        // Rejection is structured (HTTP_DOMAIN_NOT_ALLOWED).
+        const allowedDomains = policy?.allowedDomains ?? [];
+        if (allowedDomains.length > 0) {
+          const domainDecision = checkDeclaredDomain(currentUrl, allowedDomains);
+          if (!domainDecision.allowed) {
+            throw new HttpError(domainDecision.code, domainDecision.message);
+          }
         }
 
         // Network policy gate: applied to the initial URL AND to every

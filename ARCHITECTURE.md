@@ -8,6 +8,16 @@ capabilities), and 6 (normalized source result pipeline). Phase 7 is
 final validation and developer-only tooling — it adds no runtime
 capability. The engine is complete.**
 
+**v0.2.0 — the enforcement layer.** A review of 0.1.0 found that a
+manifest's `domains` were validated and stored but never read (a field
+that promised a restriction the engine did not apply) and that every
+plugin automatically received every capability. v0.2.0 closes both gaps
+without adding a phase: the six phases above remain the runtime, and the
+Plugin API gained a host-side ENFORCEMENT layer around the capabilities
+that already existed (see "v0.2.0 — Enforcement layer" below). No
+guest-visible capability was added, and a plugin that declares no domains
+and is granted the default permissions sees exactly the 0.1.0 surface.
+
 ## Layering
 
 ```
@@ -36,8 +46,10 @@ External websites
 - **Plugin Runtime** — executes plugin code in a sandboxed JavaScript
   environment. Target: a lightweight JavaScript runtime; plugins must never
   reach Node.js APIs or the host directly.
-- **Plugin API** — the only surface a plugin may call. Small, stable,
-  and versioned.
+- **Plugin API** — the only surface a plugin may call. Small, stable, and
+  versioned (`ENGINE_API_VERSION`). Since v0.2.0 each capability is also
+  individually grantable: the host decides which parts of the surface a
+  given plugin receives, and undeclared network hosts are refused.
 - **Capabilities** — HTTP requests, HTML parsing, JSON parsing. Plugins
   never perform raw I/O; all external interaction goes through capabilities
   the runtime exposes.
@@ -364,6 +376,80 @@ by design: media/stream extraction, downloading, playback, DRM/CAPTCHA/
 Cloudflare/auth bypass, browser automation, fetching or verifying result
 URLs, result caching, and automatic crawling.
 
+### v0.2.0 — Enforcement layer (no new phase)
+
+Four related gaps, all of the same kind: the engine described a
+restriction or a contract without enforcing it. The fix in each case is
+host-side and structural — the plugin contract itself is unchanged.
+
+**1. Declared domains are enforced, not documented.**
+`src/network.ts` gained a declared-domain allowlist
+(`normalizeDomainPattern`, `domainPatternMatches`, `isHostAllowed`,
+`checkDeclaredDomain`) and `src/http.ts` applies it to the initial URL
+**and every redirect hop**, before DNS and before any I/O. The two gates
+are deliberately independent and answer different questions:
+
+```
+                       request URL (host side)
+                              ↓
+   ┌──────────────────────────────────────────────────────┐
+   │ 1. DECLARED-DOMAIN gate   src/network.ts             │
+   │    "is this host inside the surface the plugin       │
+   │     told the user about?"  (manifest `domains`)      │
+   │    no DNS · no I/O · fail closed on bad patterns     │
+   └──────────────────────────────────────────────────────┘
+                              ↓
+   ┌──────────────────────────────────────────────────────┐
+   │ 2. NETWORK gate           src/network.ts             │
+   │    "is this address reachable at all?"  (SSRF)       │
+   │    loopback/RFC1918/link-local/etc. blocked,         │
+   │    every resolved address checked                    │
+   └──────────────────────────────────────────────────────┘
+                              ↓
+                        Node fetch (undici)
+```
+
+Semantics are exact-label and deterministic: a bare domain covers the
+apex and subdomains, `*.example.com` covers subdomains only, matching is
+case- and trailing-dot-insensitive, IDN is canonicalised to punycode, and
+`allowed.example.evil.test` does NOT match `allowed.example`. Malformed
+patterns never match (fail closed, so a typo cannot widen access).
+Backward compatible by construction: **no declared domains ⇒ no
+restriction from this gate**, and the host can disable enforcement
+(`enforceManifestDomains: false`) or widen every plugin
+(`extraAllowedDomains`). Both are host decisions a plugin cannot
+influence — the same trust rule the network policy already followed.
+
+**2. Capability permissions (deny per plugin, host-side).**
+`PluginPermissions` (`http`, `json`, `html`; all present by default)
+resolves in `PluginRuntime` as: per-plugin override → runtime default →
+enabled. A disabled capability is **not installed on the context object**
+at all (`buildPluginContext`), so there is nothing for guest code to
+detect, wrap, or re-enable; `http: false` removes the plugin's entire
+network surface. The granted set is exposed host-side as
+`LoadedPlugin.permissions` for audit. This is "capability-based API"
+applied where it actually bites: at the boundary where the host builds the
+guest's context, not as a runtime check inside the guest.
+
+**3. Plugin API versioning.** `ENGINE_API_VERSION` (currently 1) names the
+plugin↔engine contract (context surface + capability semantics).
+`validateManifest` rejects a manifest whose `apiVersion` exceeds it, so an
+incompatible plugin fails at validation with a clear message instead of
+mysteriously at runtime. Absent means 1 — the original contract.
+
+**4. Enable/disable is engine-owned.** `PluginManager` tracks disabled
+IDs; the state survives `discoverPlugins()` and `Plugin.enabled` carries
+it to the runtime, which refuses to load a disabled plugin
+(`PLUGIN_DISABLED`) — so "disabled" means no plugin code is evaluated,
+not merely "hidden from the list". Persistence stays an application
+concern, as before.
+
+**What did NOT change:** no guest-visible capability, no phase bump
+(`ENGINE_PHASE` stays 6), no change to `execute()` semantics, the result
+pipeline, or the sandbox isolation model. Error codes, limits, and the
+"engine-authored messages only" rule continue to apply to the new
+`HTTP_DOMAIN_NOT_ALLOWED` path.
+
 ## Planned plugin entry-point types (not implemented)
 
 - Search
@@ -376,8 +462,10 @@ URLs, result caching, and automatic crawling.
 These are concerns of the FUTURE APPLICATION that consumes this engine —
 they are not engine phases and are not implemented here:
 
-- Plugin enable/disable policy (the manager provides registry-level
-  unregister; on/off policy is an application decision)
+- Plugin enable/disable POLICY (the engine now owns and enforces the
+  on/off state per plugin — `PluginManager.setEnabled` — but persisting it
+  across process restarts, and deciding what should be disabled, remain
+  application concerns)
 - Parallel plugin execution with per-plugin scheduling (the runtime is
   concurrency-safe per plugin; a scheduler is an application concern)
 - Benchmarking/observability dashboards. A minimal, developer-only
