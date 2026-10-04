@@ -6,6 +6,19 @@ project follows [semantic versioning](https://semver.org/spec/v2.0.0.html).
 While the version is `0.x`, the plugin contract may still change; the
 engine reports the contract revision it implements as `ENGINE_API_VERSION`.
 
+## [0.5.0] — 2026-10-04
+
+### Changed
+
+- **License: GPL-3.0-only → MIT.** The engine is now permissively licensed to maximize adoption for the StormStream ecosystem and any commercial or closed-source app. See `LICENSE`. Copyright held by Skywave22. No code changes — `ENGINE_API_VERSION` stays **2**, so no plugin needs revalidating.
+- **Improved for StormStream (All-OS):** This release is the foundation for [StormStream](https://github.com/Skywave22/StormStream) — the cross-platform Flutter app (Android, iOS, Windows, macOS, Linux, Web) that runs the same plugin JS via QuickJS/JavascriptCore. The TypeScript engine remains the reference implementation; the Dart port in StormStream mirrors its `PluginContext` (manifest/log/http/json/html/store), manifest validation, network policy, storage quotas, and result normalization, so a plugin written once runs everywhere.
+- Added `INTEGRATION.md` with StormStream integration guide, and a new `release` workflow for tagged builds.
+
+### Added
+
+- `INTEGRATION.md` — how StormStream embeds the engine, sandbox backends (QuickJS ffi vs Browser ES modules), and plugin portability notes.
+- `.github/workflows/release.yml` — builds and attaches `dist/` on version tags `v*`.
+
 ## [0.4.2] — 2026-10-04
 
 ### Fixed

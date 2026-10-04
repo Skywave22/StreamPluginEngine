@@ -1,0 +1,28 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - name: Pack dist
+        run: |
+          npm pack --dry-run
+          tar -czf dist.tgz dist/ LICENSE README.md ARCHITECTURE.md CHANGELOG.md
+      - uses: softprops/action-gh-release@v1
+        with:
+          files: dist.tgz
