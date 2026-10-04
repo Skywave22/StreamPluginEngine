@@ -6,6 +6,32 @@ project follows [semantic versioning](https://semver.org/spec/v2.0.0.html).
 While the version is `0.x`, the plugin contract may still change; the
 engine reports the contract revision it implements as `ENGINE_API_VERSION`.
 
+## [0.4.1] — 2026-10-04
+
+### Fixed
+
+- **CI was red on every Node version except 20.19.0, and had been since the
+  0.2.0 push.** Not a defect in the engine: the same 316 tests that pass on
+  Node 20 pass on 22 and 24. The cause is a Node test-runner change. Node 20
+  expands a directory argument into the test files inside it; Node 22 and
+  later treat every positional argument as a file or a glob, so
+  `npm test` — which ran `node --test dist/tests/` — aborted with
+  `Error: Cannot find module '<repo>/dist/tests'` before executing a single
+  test. Because the matrix pins 20.19.0, 22.x and 24.x across three
+  operating systems, four of five jobs failed while the one job on the old
+  runtime stayed green, which made a broken gate look like a passing one.
+
+  `npm test` now runs `tools/run-tests.mjs`, which resolves
+  `dist/tests/*.test.js` itself and passes explicit file paths to
+  `node --test`. That form works on every version in `engines`
+  (>= 20.19.0) and on every OS in the matrix, needs no shell quoting, and
+  exits non-zero when the build produced no tests — a bare `node --test`
+  exits 0 having run nothing. Verified on Node 20.20.2, 22.14.0 and
+  24.0.2.
+
+- No engine behaviour changed. `ENGINE_API_VERSION` is unchanged at 2, so no
+  plugin needs to be revalidated.
+
 ## [0.4.0] — 2026-10-04
 
 **Theme: what the other plugin systems have, without their trade-offs.**

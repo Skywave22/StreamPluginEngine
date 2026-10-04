@@ -20,7 +20,7 @@ test("foundation compiles and exports engine identity", () => {
   // 0.3.0 adds playback metadata on results (format + headers), the
   // multi-plugin coordinator, the per-plugin in-flight request cap, and
   // the handle-based html capability (engine API version 2).
-  assert.equal(ENGINE_VERSION, "0.4.0");
+  assert.equal(ENGINE_VERSION, "0.4.1");
   // Regression: the engine reports the FINAL phase (Phase 6).
   assert.equal(ENGINE_PHASE, 6);
 });

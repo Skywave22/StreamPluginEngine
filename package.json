@@ -1,6 +1,6 @@
 {
   "name": "stream-plugin-engine",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Lightweight, cross-platform JavaScript/TypeScript plugin engine for a media/streaming application: sandboxed QuickJS plugins, engine-controlled HTTP with SSRF policy and enforced manifest domains, handle-based HTML/JSON parsing, per-plugin persistent storage and settings, multi-plugin fan-out, a verified plugin registry, and a normalized source-result pipeline with playback metadata.",
   "keywords": [
     "plugin",
@@ -87,7 +87,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
-    "test": "npm run build && node --test dist/tests/",
+    "test": "npm run build && node tools/run-tests.mjs",
     "bench": "npm run build && node tools/benchmark.mjs",
     "plugins:list": "npm run build && node dist/src/cli.js",
     "plugin:run": "npm run build && node dist/src/cli.js run",
