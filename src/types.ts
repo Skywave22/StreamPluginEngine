@@ -13,7 +13,8 @@ import type {
   HttpResponse,
 } from "./http.js";
 import type { AddressResolver, NetworkPolicy } from "./network.js";
-import type { PluginHtml, PluginJson } from "./phase5-types.js";
+import type { PluginHtml, PluginHtml2, PluginJson } from "./phase5-types.js";
+import type { StoreBackend } from "./store.js";
 
 /**
  * A plugin manifest as declared in `<plugin dir>/manifest.json`.
@@ -22,6 +23,40 @@ import type { PluginHtml, PluginJson } from "./phase5-types.js";
  * Optional: author, description, domains, apiVersion.
  * Unknown fields are rejected by the validator.
  */
+/**
+ * A setting a plugin DECLARES in its manifest, so an application can
+ * generate UI for it without knowing anything about the plugin.
+ *
+ * Settings are stored in the same per-plugin key-value store as
+ * `context.store`, with two differences: the declared `default` is
+ * visible even before anything is written, and a stored user value
+ * always wins over the default. The engine validates the delegation
+ * (`select` options, `mirror` values) so a bad setting cannot point a
+ * plugin outside the domains it declared.
+ *
+ * Version history: 1 = `settings` + `mirrors` (engine 0.4.0).
+ */
+export interface PluginSetting {
+  /** Store key. Same rules as `context.store`: [A-Za-z0-9._-], <= 64. */
+  key: string;
+  /**
+   * `string` | `number` | `boolean` — free-form value of that type;
+   * `select` — one of `options`;
+   * `mirror` — one of the manifest's `mirrors` (a user-selectable base
+   * host), which is the supported way to survive a provider's domain
+   * changing without shipping a new plugin version.
+   */
+  type: "string" | "number" | "boolean" | "select" | "mirror";
+  /** Default value, used when the user has not chosen one. */
+  default?: string | number | boolean;
+  /** Human-readable label for generated UI. */
+  label?: string;
+  /** Longer explanation for generated UI. */
+  description?: string;
+  /** Allowed values for `type: "select"` (2-16 entries). */
+  options?: readonly string[];
+}
+
 export interface PluginManifest {
   /**
    * Unique plugin ID. Predictable safe format: lowercase letters, digits,
@@ -61,6 +96,23 @@ export interface PluginManifest {
    * than failing mysteriously at runtime.
    */
   apiVersion?: number;
+  /**
+   * Optional alternate hosts this plugin can serve from (mirrors).
+   *
+   * Each entry uses the same domain-pattern syntax as `domains` and is
+   * ENFORCED the same way: `domains` and `mirrors` together form the
+   * plugin's HTTP allowlist. Mirrors exist because provider domains
+   * change; a plugin can declare several and let the user pick one
+   * through a `type: "mirror"` setting instead of shipping a new
+   * version. Declaring mirrors never widens a plugin's reach beyond
+   * what it states here.
+   */
+  mirrors?: readonly string[];
+  /**
+   * Optional declared settings (engine 0.4.0+), giving an application a
+   * schema for generated UI. See `PluginSetting`.
+   */
+  settings?: readonly PluginSetting[];
 }
 
 /**
@@ -84,6 +136,13 @@ export interface PluginPermissions {
   json?: boolean;
   /** `context.html` — data-only HTML parsing/selection. Default true. */
   html?: boolean;
+  /**
+   * `context.store` — per-plugin persistent key-value storage. Default
+   * true. Disabling it removes the capability entirely (and with it any
+   * way for the plugin to leave data behind on the device), which is the
+   * right choice for a plugin that is pure computation.
+   */
+  store?: boolean;
 }
 
 /** A permission set with every capability resolved to a boolean. */
@@ -147,6 +206,34 @@ export const KNOWN_CAPABILITIES = [
 export type KnownCapability = (typeof KNOWN_CAPABILITIES)[number];
 
 /**
+ * The capability vocabulary an application is expected to call, shared
+ * across the provider ecosystems this engine is built to beat:
+ *
+ * | ours | Nuvio | SkyStream | Vega |
+ * | --- | --- | --- | --- |
+ * | `home` | — | `getHome` | `getPosts` |
+ * | `search` | — | `search` | `getSearch` |
+ * | `getDetails` | — | `load` | `getMeta` |
+ * | `getEpisodes` | — | `load` (implicit) | `getEpisodes` |
+ * | `getSources` | `getStreams` | `loadStreams` | `getStream` |
+ *
+ * Plugins may expose any capability names they like (the runtime calls
+ * whatever the plugin defines), but adopting these means one application
+ * model maps onto all three ecosystems — and onto ours — without a
+ * per-provider adapter. `getSources` is the capability
+ * `PluginCoordinator.collectSources` fans out over by default.
+ */
+export const STANDARD_CAPABILITIES = [
+  "home",
+  "search",
+  "getDetails",
+  "getEpisodes",
+  "getSources",
+] as const;
+
+export type StandardCapability = (typeof STANDARD_CAPABILITIES)[number];
+
+/**
  * Controlled HTTP surface exposed to plugins as `context.http`.
  *
  * All methods return promises. Failures REJECT with a structured error
@@ -204,6 +291,25 @@ export interface PluginContext {
    * bounded input/node/result limits, structured errors.
    */
   readonly html: PluginHtml;
+}
+
+/**
+ * The plugin context a plugin receives when its manifest declares
+ * `apiVersion: 2` (or higher).
+ *
+ * Identical to `PluginContext` except that `html` is the handle-based
+ * capability (`PluginHtml2`): the document tree stays host-side and only
+ * numeric handles cross the sandbox boundary, which is several times
+ * faster and removes the ~500-level nesting limit. Everything else —
+ * `manifest`, `log`, `http`, `json`, and all limits and permissions — is
+ * unchanged.
+ *
+ * Plugin authors using apiVersion 2 can annotate their capability
+ * functions with this type; the runtime and the type describe the same
+ * thing.
+ */
+export interface PluginContextV2 extends Omit<PluginContext, "html"> {
+  readonly html: PluginHtml2;
 }
 
 /** Structured runtime error types returned by the PluginRuntime. */
@@ -325,5 +431,21 @@ export interface PluginRuntimeOptions {
      * allowlist gate entirely) and it cannot be influenced by a plugin.
      */
     extraAllowedDomains?: readonly string[];
+    /**
+     * Maximum number of concurrent host HTTP requests ONE plugin may
+     * have in flight, across all of its operations. Default 8. A plugin
+     * that exceeds it gets a structured `HTTP_TOO_MANY_REQUESTS` for
+     * the surplus request instead of the engine opening more sockets.
+     * `0` (or negative) disables the cap — a host decision.
+     */
+    maxInFlightPerPlugin?: number;
   };
+  /**
+   * Storage behind `context.store`. Defaults to an in-memory backend
+   * (values live for the runtime's lifetime). Supply a persistent
+   * implementation to keep plugin settings across restarts; see
+   * `StoreBackend` in src/store.ts. This is a HOST decision — a plugin
+   * can reach storage only through the validated `context.store` surface.
+   */
+  storeBackend?: StoreBackend;
 }

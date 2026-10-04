@@ -1,0 +1,71 @@
+
+> stream-plugin-engine@0.3.0 bench
+> npm run build && node tools/benchmark.mjs
+
+
+> stream-plugin-engine@0.3.0 build
+> tsc
+
+StreamPluginEngine — developer benchmark
+node v20.20.2, linux x64
+All inputs are static or local; no external network is used.
+
+QuickJS/Wasm module init: 11 ms (one-time, cached)
+
+Host-side (Phase 5 + Phase 6, no sandbox)
+─────────────────────────────────────────
+  host: parseHtml (20 items)               0.3166 ms/op       3,159 ops/s   (300 ops in 95 ms)
+  host: parseHtml (500 items)              6.5428 ms/op         153 ops/s   (40 ops in 262 ms)
+  host: selectHtml (20 matches)            0.4037 ms/op       2,477 ops/s   (200 ops in 81 ms)
+  host: extractHtml (1 element)            0.4071 ms/op       2,457 ops/s   (200 ops in 81 ms)
+  host: normalizeSourceResults (100)       0.3137 ms/op       3,188 ops/s   (300 ops in 94 ms)
+  host: normalizeSourceResults (1000)      3.0886 ms/op         324 ops/s   (40 ops in 124 ms)
+  host: JSON.parse (100-item payload)      0.0264 ms/op      37,865 ops/s   (500 ops in 13 ms)
+
+First plugin load (incl. context creation): 23.9 ms
+
+Guest-side, html API v1 — tree crosses the Wasm boundary (Phase 3/4/5)
+──────────────────────────────────────────────────────────────────────
+  guest: execute noop capability                 0.3416 ms/op       2,927 ops/s   (500 ops in 171 ms)
+  guest: execute returning an object             0.2252 ms/op       4,440 ops/s   (500 ops in 113 ms)
+  guest: context.json.parse                      0.3177 ms/op       3,147 ops/s   (200 ops in 64 ms)
+  guest: context.json.stringify                  0.2030 ms/op       4,927 ops/s   (500 ops in 101 ms)
+  guest: context.html.parse  [v1 tree]           3.1587 ms/op         317 ops/s   (200 ops in 632 ms)
+  guest: context.html.select [v1 tree]           5.4704 ms/op         183 ops/s   (150 ops in 821 ms)
+  guest: context.html.extract x20 [v1 tree]      8.7579 ms/op         114 ops/s   (100 ops in 876 ms)
+
+Guest-side, html API v2 — only handles cross the Wasm boundary (apiVersion 2)
+─────────────────────────────────────────────────────────────────────────────
+  guest: context.html.parse  [v2 handles]           0.5501 ms/op       1,818 ops/s   (300 ops in 165 ms)
+  guest: context.html.select [v2 handles]           0.8104 ms/op       1,234 ops/s   (300 ops in 243 ms)
+  guest: context.html.extract x20 [v2 handles]      1.9586 ms/op         511 ops/s   (200 ops in 392 ms)
+
+Lifecycle
+─────────
+  lifecycle: loadPlugin + dispose      1.6110 ms/op         621 ops/s   (60 ops in 97 ms)
+
+  fan-out sanity: 4 plugins, 4 succeeded, 20 results (60 duplicate URLs removed)
+
+Multi-plugin fan-out (PluginCoordinator)
+────────────────────────────────────────
+  coordinator: collectSources across 4 plugins (htmlSelect each)     14.2044 ms/op          70 ops/s   (40 ops in 568 ms)
+
+  I/O-bound fan-out over 4 plugins (1 loopback GET each):
+    sequential           7.42 ms/round
+    PluginCoordinator    6.28 ms/round
+    speed-up             1.18x
+    (an instant loopback fixture has no latency to hide — the win
+     scales with per-provider latency, measured next)
+
+  Same fan-out against a source with 120 ms latency (the real case):
+    sequential           493 ms/round
+    PluginCoordinator    130 ms/round
+    speed-up             3.79x
+
+HTTP (local loopback fixture — relative only, machine-dependent)
+────────────────────────────────────────────────────────────────
+  guest: context.http.get (loopback)       2.0077 ms/op         498 ops/s   (100 ops in 201 ms)
+  host: HttpClient.request (loopback)      1.1064 ms/op         904 ops/s   (100 ops in 111 ms)
+
+Done. Numbers are relative — compare the same machine across commits.
+Memory after shutdown: { rssMiB: 100.8, heapUsedMiB: 23.3 }

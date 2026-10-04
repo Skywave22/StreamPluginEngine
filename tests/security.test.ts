@@ -146,10 +146,11 @@ test("eval and Function exist but stay confined to the guest realm (no host esca
   }
 });
 
-test("the plugin context surface is exactly http + json + html + log + manifest (unchanged through Phase 6)", async (t) => {
-  // Phase 5 adds context.json and context.html to the Phase 4 surface
-  // (manifest + log + http). The surface must stay exactly this
-  // controlled set — no host objects.
+test("the plugin context surface is exactly http + json + html + store + log + manifest", async (t) => {
+  // Phase 5 added context.json and context.html to the Phase 4 surface
+  // (manifest + log + http); v0.4.0 adds context.store. The surface must
+  // stay exactly this controlled set — no host objects, and every
+  // capability enumerable so a plugin cannot hide a host reference in it.
   const base = await makeTempDir(t);
   const plugin = await writePlugin(
     base,
@@ -160,7 +161,7 @@ test("the plugin context surface is exactly http + json + html + log + manifest 
           .sort()
           .map((k) => {
             let kind = typeof context[k];
-            if (k === "http" || k === "json" || k === "html") {
+            if (k === "http" || k === "json" || k === "html" || k === "store") {
               const obj = context[k];
               if (typeof obj === "object" && obj !== null) {
                 kind = k + "(" + Object.keys(obj).sort().join(",") + ")";
@@ -185,6 +186,7 @@ test("the plugin context surface is exactly http + json + html + log + manifest 
       "json:json(parse,stringify)",
       "log:function",
       "manifest:object",
+      "store:store(all,delete,get,has,keys,set)",
     ]);
   }
 });

@@ -1,0 +1,77 @@
+
+> stream-plugin-engine@0.4.0 bench
+> npm run build && node tools/benchmark.mjs
+
+
+> stream-plugin-engine@0.4.0 build
+> tsc
+
+StreamPluginEngine — developer benchmark
+node v20.20.2, linux x64
+All inputs are static or local; no external network is used.
+
+QuickJS/Wasm module init: 11 ms (one-time, cached)
+
+Host-side (Phase 5 + Phase 6, no sandbox)
+─────────────────────────────────────────
+  host: parseHtml (20 items)               0.2684 ms/op       3,725 ops/s   (300 ops in 81 ms)
+  host: parseHtml (500 items)              6.9663 ms/op         144 ops/s   (40 ops in 279 ms)
+  host: selectHtml (20 matches)            0.3776 ms/op       2,648 ops/s   (200 ops in 76 ms)
+  host: extractHtml (1 element)            0.3717 ms/op       2,690 ops/s   (200 ops in 74 ms)
+  host: normalizeSourceResults (100)       0.2363 ms/op       4,232 ops/s   (300 ops in 71 ms)
+  host: normalizeSourceResults (1000)      2.4352 ms/op         411 ops/s   (40 ops in 97 ms)
+  host: JSON.parse (100-item payload)      0.0271 ms/op      36,871 ops/s   (500 ops in 14 ms)
+
+First plugin load (incl. context creation): 25.5 ms
+
+Guest-side, html API v1 — tree crosses the Wasm boundary (Phase 3/4/5)
+──────────────────────────────────────────────────────────────────────
+  guest: execute noop capability                 0.3776 ms/op       2,648 ops/s   (500 ops in 189 ms)
+  guest: execute returning an object             0.2530 ms/op       3,953 ops/s   (500 ops in 126 ms)
+  guest: context.json.parse                      0.3239 ms/op       3,087 ops/s   (200 ops in 65 ms)
+  guest: context.json.stringify                  0.1939 ms/op       5,157 ops/s   (500 ops in 97 ms)
+  guest: context.html.parse  [v1 tree]           3.5810 ms/op         279 ops/s   (200 ops in 716 ms)
+  guest: context.html.select [v1 tree]           5.8150 ms/op         172 ops/s   (150 ops in 872 ms)
+  guest: context.html.extract x20 [v1 tree]     10.1690 ms/op          98 ops/s   (100 ops in 1017 ms)
+
+Guest-side, html API v2 — only handles cross the Wasm boundary (apiVersion 2)
+─────────────────────────────────────────────────────────────────────────────
+  guest: context.html.parse  [v2 handles]           0.6234 ms/op       1,604 ops/s   (300 ops in 187 ms)
+  guest: context.html.select [v2 handles]           0.8486 ms/op       1,178 ops/s   (300 ops in 255 ms)
+  guest: context.html.extract x20 [v2 handles]      1.8806 ms/op         532 ops/s   (200 ops in 376 ms)
+
+Per-plugin persistent store (context.store)
+───────────────────────────────────────────
+  guest: 100x context.store.get (sync reads)      0.7457 ms/op       1,341 ops/s   (300 ops in 224 ms)
+  guest: 10x context.store.set + 1 persist        0.4606 ms/op       2,171 ops/s   (200 ops in 92 ms)
+  guest: context.store.all snapshot               0.2978 ms/op       3,358 ops/s   (300 ops in 89 ms)
+
+Lifecycle
+─────────
+  lifecycle: loadPlugin + dispose      1.6608 ms/op         602 ops/s   (60 ops in 100 ms)
+
+  fan-out sanity: 4 plugins, 4 succeeded, 20 results (60 duplicate URLs removed)
+
+Multi-plugin fan-out (PluginCoordinator)
+────────────────────────────────────────
+  coordinator: collectSources across 4 plugins (htmlSelect each)     13.2982 ms/op          75 ops/s   (40 ops in 532 ms)
+
+  I/O-bound fan-out over 4 plugins (1 loopback GET each):
+    sequential           7.89 ms/round
+    PluginCoordinator    6.88 ms/round
+    speed-up             1.15x
+    (an instant loopback fixture has no latency to hide — the win
+     scales with per-provider latency, measured next)
+
+  Same fan-out against a source with 120 ms latency (the real case):
+    sequential           492 ms/round
+    PluginCoordinator    127 ms/round
+    speed-up             3.88x
+
+HTTP (local loopback fixture — relative only, machine-dependent)
+────────────────────────────────────────────────────────────────
+  guest: context.http.get (loopback)       2.0704 ms/op         483 ops/s   (100 ops in 207 ms)
+  host: HttpClient.request (loopback)      0.7908 ms/op       1,265 ops/s   (100 ops in 79 ms)
+
+Done. Numbers are relative — compare the same machine across commits.
+Memory after shutdown: { rssMiB: 103.7, heapUsedMiB: 19.9 }

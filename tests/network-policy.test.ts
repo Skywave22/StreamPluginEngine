@@ -592,8 +592,9 @@ export const plugin = {
   };
 
   // The engine-authored surface is exactly as documented — the policy is
-  // not part of it.
-  assert.deepEqual(value.contextSurface, ["html", "http", "json", "log", "manifest"]);
+  // not part of it. (v0.4.0 adds `store`, whose storage backend is also a
+  // host-side construction option: nothing on the guest can reach it.)
+  assert.deepEqual(value.contextSurface, ["html", "http", "json", "log", "manifest", "store"]);
   assert.deepEqual(value.httpSurfaceBefore, ["get", "getJson", "request"]);
 
   // The real assertion: every tampering attempt is INEFFECTIVE.

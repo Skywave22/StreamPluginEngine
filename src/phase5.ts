@@ -56,6 +56,13 @@ export const PHASE5_LIMITS = {
   maxHtmlNodes: 50_000,
   /** Maximum number of elements returned by one html.select call. */
   maxSelectResults: 1_000,
+  /**
+   * Maximum number of live handles (documents + elements) in one
+   * capability call for the handle-based html API (apiVersion 2). The
+   * table is cleared when the call ends, so this bounds one call's
+   * working set rather than the plugin's lifetime.
+   */
+  maxHtmlHandles: 4_096,
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -94,6 +101,12 @@ export const PHASE5_ERROR_CODES = [
   "HTML_EXTRACT_ERROR",
   /** A selector matched more than PHASE5_LIMITS.maxSelectResults elements. */
   "HTML_TOO_MANY_RESULTS",
+  /** Handle-based API (apiVersion 2): the handle is expired or unknown —
+   * handles are valid for one capability call only. */
+  "HTML_STALE_HANDLE",
+  /** Handle-based API (apiVersion 2): more than
+   * PHASE5_LIMITS.maxHtmlHandles live handles in one call. */
+  "HTML_HANDLE_LIMIT",
 ] as const;
 
 export type Phase5ErrorCode = (typeof PHASE5_ERROR_CODES)[number];

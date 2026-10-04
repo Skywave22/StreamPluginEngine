@@ -80,6 +80,8 @@ export const HTTP_ERROR_CODES = [
   "HTTP_NETWORK_ERROR",
   "HTTP_RESPONSE_TOO_LARGE",
   "HTTP_TOO_MANY_REDIRECTS",
+  /** The plugin already has the maximum number of requests in flight. */
+  "HTTP_TOO_MANY_REQUESTS",
   "HTTP_INVALID_REQUEST",
   "HTTP_INTERNAL_ERROR",
   "HTTP_INVALID_JSON",

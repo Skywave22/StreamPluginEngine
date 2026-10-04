@@ -41,13 +41,19 @@ async function writePlugin(
   return dir;
 }
 
-test("example plugin is discovered from the plugins directory", async () => {
+test("example plugins are discovered from the plugins directory", async () => {
   const manager = new PluginManager();
   await manager.discoverPlugins(REPO_PLUGINS_DIR);
 
   const plugins = manager.listPlugins();
-  assert.equal(plugins.length, 1);
-  assert.equal(plugins[0]?.status, "loaded");
+  // plugins/example (apiVersion 1) and plugins/example-media (apiVersion 2).
+  assert.equal(plugins.length, 2);
+  assert.ok(plugins.every((plugin) => plugin.status === "loaded"));
+
+  const media = manager.getPlugin("example.media");
+  assert.ok(media, "example.media should be registered");
+  assert.equal(media.manifest?.apiVersion, 2);
+  assert.equal(media.manifest?.entry, "plugin.js");
 
   const example = manager.getPlugin("example.source");
   assert.ok(example, "example.source should be registered");

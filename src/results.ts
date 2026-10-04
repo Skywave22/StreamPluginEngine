@@ -43,8 +43,20 @@ export const RESULT_LIMITS = {
   maxLanguageLength: 20,
   /** Maximum length of a subtitle `format`. */
   maxSubtitleFormatLength: 30,
+  /** Maximum length of a subtitle `name` (display label). */
+  maxSubtitleNameLength: 100,
   /** Maximum number of subtitles per result. */
   maxSubtitles: 50,
+  /**
+   * Maximum number of playback headers per result (and per subtitle).
+   * A count violation rejects the input; individually invalid header
+   * entries are dropped (they are optional data).
+   */
+  maxHeaders: 16,
+  /** Maximum length of a playback header NAME. */
+  maxHeaderNameLength: 64,
+  /** Maximum length of a playback header VALUE. */
+  maxHeaderValueLength: 2_048,
   /** Maximum number of metadata keys per result. */
   maxMetadataKeys: 64,
   /** Maximum length of a metadata key. */
@@ -108,11 +120,49 @@ export const SOURCE_RESULT_TYPES = [
 
 export type SourceResultType = (typeof SOURCE_RESULT_TYPES)[number];
 
+/**
+ * Media container/playlist formats a result URL can point at.
+ *
+ * Closed enum — this exists so an APPLICATION can route a result to the
+ * right player (progressive file vs HLS vs DASH) without parsing URLs.
+ * An unrecognised or missing value means "unknown to the engine" and the
+ * field is simply dropped (the URL is still valid data).
+ */
+export const SOURCE_RESULT_FORMATS = [
+  "mp4",
+  "m3u8",
+  "mpd",
+  "mkv",
+  "webm",
+  "ts",
+  "other",
+] as const;
+
+export type SourceResultFormat = (typeof SOURCE_RESULT_FORMATS)[number];
+
+/**
+ * Playback headers attached to a result or subtitle.
+ *
+ * IMPORTANT: unlike every other field in this model, these are NOT pure
+ * data — an application hands them to a player/HTTP client. The engine
+ * therefore validates them like request headers: token names, no CR/LF
+ * or NUL in values, bounded count and length, and a denylist of
+ * hop-by-hop / request-forging names (`host`, `connection`,
+ * `content-length`, `transfer-encoding`, `upgrade`, `keep-alive`, `te`,
+ * `trailer`, `proxy-connection`) that are dropped. The engine itself
+ * never uses them (it never fetches result URLs).
+ */
+export type PlaybackHeaders = Record<string, string>;
+
 /** A subtitle attached to a result (URL + optional tags). */
 export interface SourceSubtitle {
   url: string;
   language?: string;
   format?: string;
+  /** Display label shown in a subtitle picker (may be a non-ASCII name). */
+  name?: string;
+  /** Headers a player needs to FETCH the subtitle file. */
+  headers?: PlaybackHeaders;
 }
 
 /**
@@ -132,6 +182,29 @@ export interface SourceResult {
   thumbnail?: string;
   quality?: string;
   language?: string;
+  /**
+   * Container/playlist format hint for `url` (`mp4`, `m3u8`, `mpd`, …).
+   * Lets an application pick a player without guessing from the URL.
+   */
+  format?: SourceResultFormat;
+  /**
+   * True when `url` is a continuous/live stream (a live HLS channel, a
+   * sports feed), as opposed to a title that can be resumed, seeked and
+   * cached. Lets an application skip resume-position bookkeeping, hide
+   * download actions, and pick a live-aware player UI.
+   *
+   * Only a boolean is accepted; any other value is dropped, so a plugin
+   * cannot smuggle a truthy object into a field an application branches
+   * on. `false` is kept when a plugin states it explicitly, so an
+   * application can tell "not live" from "unknown".
+   */
+  isLive?: boolean;
+  /**
+   * Headers an application needs to FETCH/PLAY `url` (typically
+   * `Referer` and `User-Agent`). Validated like request headers — see
+   * PlaybackHeaders. Never used by the engine.
+   */
+  headers?: PlaybackHeaders;
   subtitles?: SourceSubtitle[];
   /**
    * Flat metadata map. Keys and values are plain scalars
@@ -156,6 +229,9 @@ interface ValidatedSourceResult {
   thumbnail?: string;
   quality?: string;
   language?: string;
+  format?: SourceResultFormat;
+  isLive?: boolean;
+  headers?: PlaybackHeaders;
   subtitles: SourceSubtitle[];
   metadata: Record<string, string | number | boolean>;
 }
@@ -302,6 +378,100 @@ function optionalUrl(
   }
 }
 
+/** Header-name token characters (RFC 7230), same rule as src/http.ts. */
+const HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
+/**
+ * Header names an application must not be told to send: hop-by-hop /
+ * request-framing headers, plus `host` (which would let a plugin
+ * redirect a player's connection to a different virtual host).
+ * Matching is case-insensitive; offending entries are dropped.
+ */
+const FORBIDDEN_HEADER_NAMES = new Set([
+  "host",
+  "connection",
+  "content-length",
+  "transfer-encoding",
+  "upgrade",
+  "keep-alive",
+  "te",
+  "trailer",
+  "proxy-connection",
+]);
+
+/**
+ * Validate a playback-header map (result `headers` / subtitle `headers`).
+ *
+ * Optional field semantics, with one deliberate difference: because these
+ * headers are consumed by a player rather than treated as inert data,
+ * invalid ENTRIES are dropped but a COUNT violation rejects the input
+ * (same rule the subtitle list uses). Prototype-polluting keys are
+ * dropped, not copied.
+ */
+function playbackHeaders(
+  value: unknown,
+  at: string,
+  field: string,
+): PlaybackHeaders | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!isPlainObject(value)) return undefined; // wrong type → dropped
+
+  const keys = Object.keys(value);
+  if (keys.length > RESULT_LIMITS.maxHeaders) {
+    throw new ResultError(
+      "RESULT_FIELD_TOO_LONG",
+      `${at}: '${field}' has ${keys.length} entries; the maximum is ${RESULT_LIMITS.maxHeaders}`,
+    );
+  }
+
+  const headers: PlaybackHeaders = {};
+  for (const key of keys) {
+    const name = key.trim();
+    if (
+      name.length === 0 ||
+      name.length > RESULT_LIMITS.maxHeaderNameLength ||
+      !HEADER_NAME_RE.test(name)
+    ) {
+      continue; // invalid name → dropped
+    }
+    if (
+      name === "__proto__" ||
+      name === "constructor" ||
+      name === "prototype" ||
+      FORBIDDEN_HEADER_NAMES.has(name.toLowerCase())
+    ) {
+      continue; // unsafe name → dropped
+    }
+    const raw = value[key];
+    if (typeof raw !== "string") continue;
+    const trimmed = raw.trim();
+    if (
+      trimmed.length === 0 ||
+      trimmed.length > RESULT_LIMITS.maxHeaderValueLength ||
+      // CR/LF/NUL would allow header injection downstream.
+      /[\r\n\0]/.test(trimmed)
+    ) {
+      continue; // invalid value → dropped
+    }
+    headers[name] = trimmed;
+  }
+
+  return Object.keys(headers).length > 0 ? headers : undefined;
+}
+
+/** OPTIONAL closed-enum format field; unrecognised values are dropped. */
+function optionalFormat(
+  item: Record<string, unknown>,
+  field: string,
+): SourceResultFormat | undefined {
+  const value = item[field];
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase();
+  return (SOURCE_RESULT_FORMATS as readonly string[]).includes(normalized)
+    ? (normalized as SourceResultFormat)
+    : undefined;
+}
+
 // ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
@@ -340,6 +510,17 @@ function validateItem(item: unknown, index: number): ValidatedSourceResult {
   const urlRaw = requiredString(item, "url", RESULT_LIMITS.maxUrlLength, at);
   const url = new URL(normalizeUrl(urlRaw, "url", at));
 
+  // Playback metadata for the application's player: format hint and the
+  // headers needed to fetch/play the URL. Optional; invalid entries are
+  // dropped, a count violation rejects.
+  const format = optionalFormat(item, "format");
+  // Strict boolean: `"true"`, 1 and {} are all dropped rather than
+  // coerced, because an application branches on this value. An explicit
+  // `false` IS preserved, so "the plugin says: not live" stays
+  // distinguishable from "the plugin did not say".
+  const isLive = typeof item.isLive === "boolean" ? item.isLive : undefined;
+  const headers = playbackHeaders(item.headers, at, "headers");
+
   // Subtitles: a bounded list; items with invalid URLs are dropped.
   const subtitles: SourceSubtitle[] = [];
   if (item.subtitles !== undefined && item.subtitles !== null) {
@@ -372,6 +553,10 @@ function validateItem(item: unknown, index: number): ValidatedSourceResult {
       if (language !== undefined) sub.language = language;
       const format = optionalString(rawSub, "format", RESULT_LIMITS.maxSubtitleFormatLength);
       if (format !== undefined) sub.format = format;
+      const name = optionalString(rawSub, "name", RESULT_LIMITS.maxSubtitleNameLength);
+      if (name !== undefined) sub.name = name;
+      const subHeaders = playbackHeaders(rawSub.headers, subAt, "headers");
+      if (subHeaders !== undefined) sub.headers = subHeaders;
       subtitles.push(sub);
     }
   }
@@ -448,6 +633,9 @@ function validateItem(item: unknown, index: number): ValidatedSourceResult {
     thumbnail: optionalUrl(item, "thumbnail"),
     quality: optionalString(item, "quality", RESULT_LIMITS.maxQualityLength),
     language: optionalString(item, "language", RESULT_LIMITS.maxLanguageLength),
+    format,
+    isLive,
+    headers,
     subtitles,
     metadata,
   };
@@ -470,6 +658,9 @@ function toNormalized(validated: ValidatedSourceResult): SourceResult {
   if (validated.thumbnail !== undefined) result.thumbnail = validated.thumbnail;
   if (validated.quality !== undefined) result.quality = validated.quality;
   if (validated.language !== undefined) result.language = validated.language;
+  if (validated.format !== undefined) result.format = validated.format;
+  if (validated.isLive !== undefined) result.isLive = validated.isLive;
+  if (validated.headers !== undefined) result.headers = { ...validated.headers };
   if (validated.subtitles.length > 0) result.subtitles = validated.subtitles;
   return result;
 }

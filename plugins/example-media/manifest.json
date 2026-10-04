@@ -1,0 +1,42 @@
+{
+  "id": "example.media",
+  "name": "Example Media Source",
+  "version": "1.0.0",
+  "author": "StreamPluginEngine",
+  "description": "Example source plugin on plugin API v2 \u2014 handle-based html, persistent settings (mirror + quality), isLive, and app-ready results (format + playback headers). Fully offline fixture.",
+  "entry": "plugin.js",
+  "apiVersion": 2,
+  "domains": [
+    "cdn.example"
+  ],
+  "mirrors": [
+    "cdn.example",
+    "mirror.example"
+  ],
+  "settings": [
+    {
+      "key": "baseUrl",
+      "type": "mirror",
+      "default": "cdn.example",
+      "label": "Mirror",
+      "description": "CDN host to build result URLs from"
+    },
+    {
+      "key": "quality",
+      "type": "select",
+      "default": "auto",
+      "options": [
+        "auto",
+        "1080p",
+        "720p"
+      ],
+      "label": "Preferred quality"
+    },
+    {
+      "key": "includeLive",
+      "type": "boolean",
+      "default": true,
+      "label": "Include live channels"
+    }
+  ]
+}

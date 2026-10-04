@@ -43,6 +43,9 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 
 import { getQuickJS, shouldInterruptAfterDeadline } from "quickjs-emscripten";
+import { createPluginStore, findSetting } from "./store.js";
+import type { PluginStore, StoreBackend } from "./store.js";
+import { MemoryStoreBackend } from "./store.js";
 import type {
   QuickJSContext,
   QuickJSDeferredPromise,
@@ -61,7 +64,11 @@ import {
   parseHtml,
   selectHtml,
 } from "./phase5.js";
-import type { Phase5ErrorCode } from "./phase5.js";
+import type {
+  HtmlDocument,
+  HtmlElement,
+  Phase5ErrorCode,
+} from "./phase5.js";
 import type {
   LoadedPlugin,
   Plugin,
@@ -76,12 +83,27 @@ import type { PluginExecutionResult, PluginManifest } from "./types.js";
 
 const DEFAULT_TIMEOUT_MS = 5000;
 const DEFAULT_MEMORY_LIMIT_BYTES = 64 * 1024 * 1024;
+/**
+ * Concurrent host HTTP requests allowed per plugin. A media-source
+ * plugin often wants to fetch several mirrors at once; 8 covers that
+ * without letting one plugin open an unbounded number of sockets.
+ */
+const DEFAULT_MAX_INFLIGHT_PER_PLUGIN = 8;
 
 /** Every capability is enabled unless the host application says otherwise. */
+/**
+ * Default storage behind `context.store` when the host does not supply a
+ * backend: values live for the lifetime of this runtime. A host that
+ * wants plugin settings to survive a restart passes its own
+ * `StoreBackend` (see src/store.ts).
+ */
+const DEFAULT_STORE_BACKEND: StoreBackend = new MemoryStoreBackend();
+
 const DEFAULT_PERMISSIONS: ResolvedPluginPermissions = {
   http: true,
   json: true,
   html: true,
+  store: true,
 };
 
 /** Resolve a (partial) permission set against the safe default. */
@@ -93,6 +115,7 @@ function resolvePermissions(
     http: permissions?.http ?? base.http,
     json: permissions?.json ?? base.json,
     html: permissions?.html ?? base.html,
+    store: permissions?.store ?? base.store,
   };
 }
 
@@ -145,6 +168,33 @@ class RuntimeFailure extends Error {
 }
 
 /**
+ * Host-side handle table backing the apiVersion-2 HTML capability.
+ *
+ * Documents and elements are stored as ordinary JSON data and addressed
+ * by integer handles. Nothing here is guest-visible except the numbers,
+ * so the guest can neither inspect host structures nor smuggle a forged
+ * document object into the selector engine.
+ */
+interface HtmlHandleTable {
+  next: number;
+  documents: Map<number, HtmlDocument>;
+  elements: Map<number, HtmlElement>;
+  /** Live handle count (documents + elements). */
+  size(): number;
+}
+
+function createHtmlHandleTable(): HtmlHandleTable {
+  const documents = new Map<number, HtmlDocument>();
+  const elements = new Map<number, HtmlElement>();
+  return {
+    next: 1,
+    documents,
+    elements,
+    size: () => documents.size + elements.size,
+  };
+}
+
+/**
  * One capability call currently in flight on a plugin.
  *
  * `dispose()` needs this: guest handles owned by an unfinished operation
@@ -188,6 +238,13 @@ class LoadedPluginHandle implements LoadedPlugin {
    */
   readonly inFlightHttp = new Set<AbortController>();
   /**
+   * Number of host HTTP requests this plugin currently has in flight
+   * (across all of its operations). Bounded by
+   * `maxInFlightPerPlugin`, so a plugin cannot open an unbounded number
+   * of sockets by fanning out with `Promise.all`.
+   */
+  inFlightRequests = 0;
+  /**
    * Tail of this plugin's operation queue.
    *
    * Guest operations on ONE plugin sandbox are serialized, and this is a
@@ -221,6 +278,28 @@ class LoadedPluginHandle implements LoadedPlugin {
   readonly activeOperations = new Set<ActiveOperation>();
   /** Set when the guest environment has been (or is being) disposed. */
   disposed = false;
+  /**
+   * Handle table for the apiVersion-2 HTML capability: parsed documents
+   * and selected elements live HERE, host-side, and the guest only ever
+   * sees numeric handles. Plain JSON data — no QuickJS handles — so
+   * disposal needs no ordering guarantees; it is simply cleared when the
+   * capability call ends.
+   */
+  readonly htmlHandles: HtmlHandleTable = createHtmlHandleTable();
+  /**
+   * This plugin's persistent key-value store (engine 0.4.0+). Values are
+   * loaded ONCE at plugin load and held host-side, so `context.store`
+   * reads are synchronous and free — no Wasm round trip, no promise tick
+   * per read, which is what an async bridge-per-get design costs. Writes
+   * are validated in place and persisted once, when the capability call
+   * that made them ends.
+   */
+  readonly store: PluginStore;
+
+  /** The plugin contract revision this plugin declared (1 when absent). */
+  get apiVersion(): number {
+    return this.manifest.apiVersion ?? 1;
+  }
 
   constructor(
     manifest: PluginManifest,
@@ -230,6 +309,7 @@ class LoadedPluginHandle implements LoadedPlugin {
     capabilityFns: Map<string, QuickJSHandle>,
     permissions: ResolvedPluginPermissions,
     allowedDomains: readonly string[],
+    storeBackend: StoreBackend,
   ) {
     this.pluginId = manifest.id;
     this.manifest = manifest;
@@ -239,10 +319,21 @@ class LoadedPluginHandle implements LoadedPlugin {
     this.capabilityFns = capabilityFns;
     this.permissions = permissions;
     this.allowedDomains = allowedDomains;
+    this.store = createPluginStore(manifest.id, storeBackend, manifest);
   }
 
   dispose(): void {
     this.disposed = true;
+    // Best-effort final flush: `dispose` is synchronous by contract, so
+    // the save is started and its failure logged rather than awaited.
+    if (this.store.isDirty) {
+      void Promise.resolve()
+        .then(() => this.store.persist())
+        .catch(() => {
+          // A host backend that fails on shutdown is a host problem;
+          // there is no operation left to report it to.
+        });
+    }
     for (const controller of this.inFlightHttp) {
       controller.abort(new Error("plugin disposed"));
     }
@@ -296,6 +387,10 @@ export class PluginRuntime {
   private readonly enforceManifestDomains: boolean;
   /** Host-supplied extra domains every plugin may reach. */
   private readonly extraAllowedDomains: readonly string[];
+  /** Max concurrent host HTTP requests per plugin (0 = unlimited). */
+  private readonly maxInFlightPerPlugin: number;
+  /** Storage behind `context.store` for every plugin this runtime loads. */
+  private readonly storeBackend: StoreBackend;
 
   constructor(options: PluginRuntimeOptions = {}) {
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -312,6 +407,9 @@ export class PluginRuntime {
     this.perPluginPermissions = options.perPluginPermissions ?? {};
     this.enforceManifestDomains = options.http?.enforceManifestDomains ?? true;
     this.extraAllowedDomains = options.http?.extraAllowedDomains ?? [];
+    this.maxInFlightPerPlugin =
+      options.http?.maxInFlightPerPlugin ?? DEFAULT_MAX_INFLIGHT_PER_PLUGIN;
+    this.storeBackend = options.storeBackend ?? DEFAULT_STORE_BACKEND;
   }
 
   /**
@@ -343,9 +441,14 @@ export class PluginRuntime {
     if (!this.enforceManifestDomains) {
       return [];
     }
-    const declared = (manifest.domains ?? []).filter(
-      (domain) => domain.trim().length > 0,
-    );
+    // `mirrors` are alternate hosts for the SAME plugin, so they join
+    // the allowlist. They can never widen a plugin's reach beyond hosts
+    // it declared in its own manifest, and the host's enforcement switch
+    // covers both lists equally.
+    const declared = [
+      ...(manifest.domains ?? []),
+      ...(manifest.mirrors ?? []),
+    ].filter((domain) => domain.trim().length > 0);
     return [...new Set([...declared, ...hostExtras])];
   }
 
@@ -512,7 +615,14 @@ export class PluginRuntime {
         capabilityFns,
         this.permissionsFor(manifest.id),
         this.allowedDomainsFor(manifest),
+        this.storeBackend,
       );
+      // Seed context.store from the host backend before the plugin is
+      // reachable. A backend failure is NOT a load failure: the plugin
+      // still works, it just starts from its declared defaults rather
+      // than from stored values.
+      await handle.store.load();
+      this.reportStoreError(handle);
       this.loaded.add(handle);
       return { ok: true, plugin: handle, loadTimeMs: loadTimeMs() };
     } catch (error) {
@@ -694,6 +804,24 @@ export class PluginRuntime {
       return fail(this.toRuntimeError(error, "PLUGIN_RUNTIME_ERROR"));
     } finally {
       handle.activeOperations.delete(operation);
+      // Persist context.store ONCE per capability call, and only if the
+      // plugin actually wrote something. A backend failure never fails
+      // the operation (the plugin's work already succeeded); it is
+      // reported through the logger instead, and the store stays dirty
+      // so the next call tries again.
+      if (runtime.alive && handle.store.isDirty) {
+        try {
+          await handle.store.persist();
+        } catch {
+          // Already captured on the store; reported just below.
+        }
+        this.reportStoreError(handle);
+      }
+      // Handles are scoped to ONE capability call: dropping them here is
+      // what makes "stale handle" a structured error instead of a
+      // cross-call surprise, and it bounds the table's lifetime.
+      handle.htmlHandles.documents.clear();
+      handle.htmlHandles.elements.clear();
       if (runtime.alive) {
         runtime.removeInterruptHandler();
       }
@@ -941,6 +1069,112 @@ export class PluginRuntime {
     context.setProp(contextObject, "manifest", manifestHandle);
     context.setProp(contextObject, "log", logFn);
 
+    // context.store — engine 0.4.0. Per-plugin persistent key-value
+    // storage, bridged SYNCHRONOUSLY: the host-side map is already in
+    // memory, so `get`/`keys`/`all` cost a function call rather than a
+    // promise round trip, and `set` writes in place. The whole store is
+    // persisted once, when this capability call ends. Absent entirely
+    // when the host disabled the store capability.
+    if (handle.permissions.store) {
+      const storeObject = track(context.newObject(), tracked);
+      const storeGet = track(
+        context.newFunction("get", (...args: QuickJSHandle[]) => {
+          const key = this.readString(context, args[0]);
+          if (key === null) return context.undefined;
+          const fallback = this.readValue(context, args[1]);
+          const value = handle.store.get(key, fallback);
+          if (value === undefined) return context.undefined;
+          return this.jsonToHandle(context, value, tracked);
+        }),
+        tracked,
+      );
+      const storeSet = track(
+        context.newFunction("set", (...args: QuickJSHandle[]) => {
+          const key = this.readString(context, args[0]);
+          if (key === null) {
+            return this.phase5Rejected(
+              handle,
+              "STORE_INVALID_KEY",
+              "context.store.set requires a string key",
+              tracked,
+            );
+          }
+          // Guest functions are refused EXPLICITLY: `dump()` renders a
+          // function as its own source text, so without this guard
+          // `store.set("f", () => 1)` would quietly store the STRING
+          // "() => 1" and read back as text.
+          if (args[1] !== undefined && context.typeof(args[1]) === "function") {
+            return this.phase5Rejected(
+              handle,
+              "STORE_INVALID_VALUE",
+              "Functions cannot be stored (the value would be kept as source text)",
+              tracked,
+            );
+          }
+          const value = this.readValue(context, args[1]);
+          // A mirror setting may only hold one of the manifest's declared
+          // mirrors; anything else is refused rather than stored, so the
+          // engine never hands a plugin a base URL it would then refuse at
+          // the HTTP layer.
+          const mirrorProblem = this.checkMirrorSetting(handle, key, value);
+          if (mirrorProblem) {
+            return this.phase5Rejected(
+              handle,
+              "STORE_INVALID_VALUE",
+              mirrorProblem,
+              tracked,
+            );
+          }
+          const result = handle.store.set(key, value);
+          if (!result.ok) {
+            return this.phase5Rejected(
+              handle,
+              result.error.code,
+              result.error.message,
+              tracked,
+            );
+          }
+          return context.true;
+        }),
+        tracked,
+      );
+      const storeDelete = track(
+        context.newFunction("delete", (...args: QuickJSHandle[]) => {
+          const key = this.readString(context, args[0]);
+          if (key === null) return context.false;
+          return handle.store.delete(key) ? context.true : context.false;
+        }),
+        tracked,
+      );
+      const storeHas = track(
+        context.newFunction("has", (...args: QuickJSHandle[]) => {
+          const key = this.readString(context, args[0]);
+          if (key === null) return context.false;
+          return handle.store.has(key) ? context.true : context.false;
+        }),
+        tracked,
+      );
+      const storeKeys = track(
+        context.newFunction("keys", () =>
+          this.jsonToHandle(context, handle.store.keys(), tracked),
+        ),
+        tracked,
+      );
+      const storeAll = track(
+        context.newFunction("all", () =>
+          this.jsonToHandle(context, handle.store.all(), tracked),
+        ),
+        tracked,
+      );
+      context.setProp(storeObject, "get", storeGet);
+      context.setProp(storeObject, "set", storeSet);
+      context.setProp(storeObject, "delete", storeDelete);
+      context.setProp(storeObject, "has", storeHas);
+      context.setProp(storeObject, "keys", storeKeys);
+      context.setProp(storeObject, "all", storeAll);
+      context.setProp(contextObject, "store", storeObject);
+    }
+
     // context.http — the ONLY network surface a plugin has. Absent
     // entirely when the host disabled the http capability: a disabled
     // capability is not "a function that throws", it does not exist.
@@ -988,26 +1222,39 @@ export class PluginRuntime {
     }
 
     // context.html — Phase 5. Host-bridged synchronous functions: the
-    // work (parse/select/serialize) happens host-side in src/phase5.ts
-    // and the result crosses back as plain JSON. Failures return a
-    // rejected promise carrying a structured { code, message } object.
+    // work (parse/select/serialize) happens host-side in src/phase5.ts.
+    // Two implementations, chosen by the plugin's declared apiVersion:
+    //   - v1 (apiVersion 1 / absent): the document TREE crosses the
+    //     boundary in both directions (unchanged since Phase 5).
+    //   - v2 (apiVersion >= 2): only numeric handles cross; the tree
+    //     stays in this process. Same guarantees, much less boundary
+    //     traffic, and no ~500-level nesting limit.
+    // Failures return a rejected promise carrying a structured
+    // { code, message } object in both modes.
     if (handle.permissions.html) {
       const htmlObject = track(context.newObject(), tracked);
+      const useHandles = handle.apiVersion >= 2;
       const htmlParseFn = track(
         context.newFunction("parse", (...args: QuickJSHandle[]) =>
-          this.phase5Parse(handle, args[0], tracked),
+          useHandles
+            ? this.phase5ParseV2(handle, args[0], tracked)
+            : this.phase5Parse(handle, args[0], tracked),
         ),
         tracked,
       );
       const htmlSelectFn = track(
         context.newFunction("select", (...args: QuickJSHandle[]) =>
-          this.phase5Select(handle, args[0], args[1], tracked),
+          useHandles
+            ? this.phase5SelectV2(handle, args[0], args[1], tracked)
+            : this.phase5Select(handle, args[0], args[1], tracked),
         ),
         tracked,
       );
       const htmlExtractFn = track(
         context.newFunction("extract", (...args: QuickJSHandle[]) =>
-          this.phase5Extract(handle, args[0], tracked),
+          useHandles
+            ? this.phase5ExtractV2(handle, args[0], tracked)
+            : this.phase5Extract(handle, args[0], tracked),
         ),
         tracked,
       );
@@ -1020,15 +1267,261 @@ export class PluginRuntime {
     return contextObject;
   }
 
+  // ------------------------------------------------------------------
+  // apiVersion 2: handle-based HTML capability
+  // ------------------------------------------------------------------
+
+  /** Store a document/element and return its handle, or throw Phase5Error. */
+  private storeHtmlHandle(
+    handle: LoadedPluginHandle,
+    value: HtmlDocument | HtmlElement,
+  ): number {
+    const table = handle.htmlHandles;
+    if (table.size() >= PHASE5_LIMITS.maxHtmlHandles) {
+      throw new Phase5Error(
+        "HTML_HANDLE_LIMIT",
+        `html handles per call are limited to ${PHASE5_LIMITS.maxHtmlHandles}`,
+      );
+    }
+    const id = table.next;
+    table.next += 1;
+    if (value.type === "document") {
+      table.documents.set(id, value);
+    } else {
+      table.elements.set(id, value);
+    }
+    return id;
+  }
+
+  /** Read a numeric handle argument (non-numbers yield null). */
+  private readHandleArg(
+    context: QuickJSContext,
+    arg: QuickJSHandle | undefined,
+  ): number | null {
+    if (arg === undefined) return null;
+    if (context.typeof(arg) !== "number") return null;
+    const value = context.getNumber(arg);
+    return Number.isInteger(value) && value > 0 ? value : null;
+  }
+
+  /**
+   * Settle a structured Phase 5 error for the handle API. `handle` is
+   * optional so the same helper serves `HTML_STALE_HANDLE`.
+   */
+  private phase5V2Rejected(
+    handle: LoadedPluginHandle,
+    code: Phase5ErrorCode,
+    message: string,
+    tracked: Disposable[],
+  ): QuickJSHandle {
+    return this.phase5Rejected(handle, code, message, tracked);
+  }
+
+  /** v2 `html.parse(html)` → numeric document handle. */
+  private phase5ParseV2(
+    handle: LoadedPluginHandle,
+    arg: QuickJSHandle | undefined,
+    tracked: Disposable[],
+  ): QuickJSHandle {
+    const context = handle.context;
+    if (arg === undefined || context.typeof(arg) !== "string") {
+      return this.phase5V2Rejected(
+        handle,
+        "HTML_INVALID_INPUT",
+        "html.parse() requires a string",
+        tracked,
+      );
+    }
+    const html = context.getString(arg);
+    if (Buffer.byteLength(html, "utf8") > PHASE5_LIMITS.maxHtmlBytes) {
+      return this.phase5V2Rejected(
+        handle,
+        "HTML_INPUT_TOO_LARGE",
+        "HTML input exceeds 5 MiB",
+        tracked,
+      );
+    }
+    try {
+      const document = parseHtml(html);
+      return this.jsonToHandle(context, this.storeHtmlHandle(handle, document), tracked);
+    } catch (error) {
+      return this.phase5V2Rejected(
+        handle,
+        error instanceof Phase5Error ? error.code : "HTML_PARSE_ERROR",
+        error instanceof Phase5Error ? error.message : "HTML parsing failed",
+        tracked,
+      );
+    }
+  }
+
+  /** v2 `html.select(documentHandle, selector)` → numeric element handles. */
+  private phase5SelectV2(
+    handle: LoadedPluginHandle,
+    documentArg: QuickJSHandle | undefined,
+    selectorArg: QuickJSHandle | undefined,
+    tracked: Disposable[],
+  ): QuickJSHandle {
+    const context = handle.context;
+    const documentId = this.readHandleArg(context, documentArg);
+    if (documentId === null) {
+      return this.phase5V2Rejected(
+        handle,
+        "HTML_SELECT_ERROR",
+        "html.select() requires a document handle from html.parse()",
+        tracked,
+      );
+    }
+    if (selectorArg === undefined || context.typeof(selectorArg) !== "string") {
+      return this.phase5V2Rejected(
+        handle,
+        "HTML_INVALID_SELECTOR",
+        "html.select() requires a non-empty selector string",
+        tracked,
+      );
+    }
+    const root =
+      handle.htmlHandles.documents.get(documentId) ??
+      handle.htmlHandles.elements.get(documentId);
+    if (root === undefined) {
+      return this.phase5V2Rejected(
+        handle,
+        "HTML_STALE_HANDLE",
+        "html handle is expired or unknown (handles are valid for one capability call)",
+        tracked,
+      );
+    }
+    try {
+      const matches = selectHtml(root, context.getString(selectorArg));
+      const ids = matches.map((element) => this.storeHtmlHandle(handle, element));
+      return this.jsonToHandle(context, ids, tracked);
+    } catch (error) {
+      return this.phase5V2Rejected(
+        handle,
+        error instanceof Phase5Error ? error.code : "HTML_SELECT_ERROR",
+        error instanceof Phase5Error ? error.message : "HTML selection failed",
+        tracked,
+      );
+    }
+  }
+
+  /** v2 `html.extract(elementHandle)` → info object. */
+  private phase5ExtractV2(
+    handle: LoadedPluginHandle,
+    arg: QuickJSHandle | undefined,
+    tracked: Disposable[],
+  ): QuickJSHandle {
+    const context = handle.context;
+    const elementId = this.readHandleArg(context, arg);
+    if (elementId === null) {
+      return this.phase5V2Rejected(
+        handle,
+        "HTML_INVALID_ELEMENT",
+        "html.extract() requires an element handle from html.select()",
+        tracked,
+      );
+    }
+    const element = handle.htmlHandles.elements.get(elementId);
+    if (element === undefined) {
+      return this.phase5V2Rejected(
+        handle,
+        "HTML_STALE_HANDLE",
+        "html handle is expired or unknown (handles are valid for one capability call)",
+        tracked,
+      );
+    }
+    try {
+      return this.jsonToHandle(context, extractHtml(element), tracked);
+    } catch (error) {
+      return this.phase5V2Rejected(
+        handle,
+        error instanceof Phase5Error ? error.code : "HTML_EXTRACT_ERROR",
+        error instanceof Phase5Error ? error.message : "HTML extraction failed",
+        tracked,
+      );
+    }
+  }
+
   /**
    * Settle a Phase 5 HTML failure: return a handle to a REJECTED PROMISE
    * carrying the structured { code, message } object. The guest awaits
    * it (or the capability's unhandled rejection surfaces to the host as
    * a structured PLUGIN_RUNTIME_ERROR, same path as HTTP errors).
    */
+  /**
+   * Reads a guest argument as a string, or `null` when it is absent or of
+   * another type. Used by `context.store` for keys, where "not a string"
+   * must become a structured refusal rather than a node-style coercion.
+   */
+  /**
+   * Reports a store backend failure to the host ONCE (the store hands it
+   * over and clears it), so a broken disk does not produce a log line per
+   * operation while still never being silent.
+   */
+  private reportStoreError(handle: LoadedPluginHandle): void {
+    const error = handle.store.takeLastError();
+    if (error) {
+      this.logger(handle.pluginId, `${error.code}: ${error.message}`);
+    }
+  }
+
+  /** Dumps a guest argument into host data, or undefined when absent. */
+  private readValue(
+    context: QuickJSContext,
+    arg: QuickJSHandle | undefined,
+  ): unknown {
+    return arg === undefined ? undefined : context.dump(arg);
+  }
+
+  private readString(
+    context: QuickJSContext,
+    arg: QuickJSHandle | undefined,
+  ): string | null {
+    if (arg === undefined) return null;
+    try {
+      if (context.typeof(arg) !== "string") return null;
+      return context.getString(arg);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Applies the type rules of a DECLARED setting to a write.
+   *
+   * Only `mirror` needs one at write time: its value must be one of the
+   * manifest's declared mirrors. Refusing it here means a plugin can
+   * never read back a base URL that the HTTP layer would then reject, and
+   * a user's stored choice cannot point the plugin somewhere its own
+   * manifest did not declare. Returns a message when the write must be
+   * refused.
+   */
+  private checkMirrorSetting(
+    handle: LoadedPluginHandle,
+    key: string,
+    value: unknown,
+  ): string | null {
+    const setting = findSetting(handle.manifest.settings, key);
+    if (!setting) return null;
+    if (setting.type !== "mirror") return null;
+    const mirrors = handle.manifest.mirrors ?? [];
+    if (typeof value !== "string" || !mirrors.includes(value)) {
+      return `Setting '${key}' must be one of this plugin's declared mirrors: ${mirrors.join(", ")}`;
+    }
+    return null;
+  }
+
+  /**
+   * Builds a REJECTED promise carrying a structured `{ code, message }`
+   * object — the error contract shared by every capability that reports
+   * failures asynchronously rather than by throwing.
+   *
+   * The code is a plain string here (not one of the HTML unions) because
+   * more than one capability answers with this shape; each caller passes
+   * a code from its own documented set.
+   */
   private phase5Rejected(
     handle: LoadedPluginHandle,
-    code: Phase5ErrorCode,
+    code: string,
     message: string,
     tracked: Disposable[],
   ): QuickJSHandle {
@@ -1280,15 +1773,34 @@ export class PluginRuntime {
       }
     }
 
+    // Per-plugin in-flight cap: a plugin fanning out with Promise.all
+    // can otherwise open an unbounded number of host sockets. The
+    // rejected promise is structured, so `Promise.allSettled`-style
+    // plugin code degrades gracefully instead of failing wholesale.
+    if (
+      request !== undefined &&
+      this.maxInFlightPerPlugin > 0 &&
+      handle.inFlightRequests >= this.maxInFlightPerPlugin
+    ) {
+      request = undefined;
+      invalid = {
+        code: "HTTP_TOO_MANY_REQUESTS",
+        message: `Plugin already has ${this.maxInFlightPerPlugin} HTTP requests in flight; the engine limit is ${this.maxInFlightPerPlugin}`,
+      };
+    }
+
     // Schedule the host-side work. The promise is always settled (or the
     // operation ends first, which aborts the request and drains the
     // guest), so the guest never sees an unhandled rejection.
     if (request !== undefined) {
-      void this.finishHttpCall(handle, deferred, operation, request, opAbort.signal).catch(
-        () => {
+      handle.inFlightRequests += 1;
+      void this.finishHttpCall(handle, deferred, operation, request, opAbort.signal)
+        .catch(() => {
           // finishHttpCall never rejects; this is a defensive guard.
-        },
-      );
+        })
+        .finally(() => {
+          handle.inFlightRequests -= 1;
+        });
     } else if (invalid !== undefined) {
       void this.settleHttpError(handle, deferred, invalid).catch(() => {});
     } else {

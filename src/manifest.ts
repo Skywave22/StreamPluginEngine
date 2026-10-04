@@ -1,6 +1,8 @@
+import { isValidStoreKey } from "./store.js";
 import type {
   ManifestValidationResult,
   PluginManifest,
+  PluginSetting,
 } from "./types.js";
 
 /**
@@ -23,6 +25,8 @@ const KNOWN_FIELDS: ReadonlySet<string> = new Set([
   "description",
   "domains",
   "apiVersion",
+  "mirrors",
+  "settings",
 ]);
 
 /**
@@ -34,11 +38,160 @@ const KNOWN_FIELDS: ReadonlySet<string> = new Set([
  * not implement is rejected at validation time, so an incompatible
  * plugin fails loudly at load instead of mysteriously at runtime.
  * Absent means 1 (the original contract).
+ *
+ * Version history:
+ * - **1** — `context.html.parse/select/extract` exchange JSON document
+ *   trees and element nodes with the guest.
+ * - **2** — `context.html` is HANDLE-based: `parse` returns a numeric
+ *   document handle, `select` returns numeric element handles, `extract`
+ *   returns the info object. The tree never crosses the Wasm boundary,
+ *   which makes the pipeline several times faster, removes the ~500-level
+ *   nesting limit (a QuickJS value-delivery limit), and stops untrusted
+ *   document structures from being handed to the host selector engine.
+ *   Manifests with apiVersion 1 (or absent) keep the version-1 behaviour
+ *   unchanged, so no existing plugin breaks.
  */
-export const ENGINE_API_VERSION = 1;
+export const ENGINE_API_VERSION = 2;
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+const SETTING_TYPES: ReadonlySet<string> = new Set([
+  "string",
+  "number",
+  "boolean",
+  "select",
+  "mirror",
+]);
+
+/** Maximum entries in a `select` setting's `options` list. */
+const MAX_SETTING_OPTIONS = 16;
+
+/**
+ * Validates ONE declared setting. Returns human-readable problems (empty
+ * when the setting is fine).
+ *
+ * The interesting cases are the two constrained types: a `select` whose
+ * default is not among its own options, and a `mirror` whose value is not
+ * one of the manifest's declared mirrors. Both are rejected at validation
+ * time, because either would otherwise hand an application a value the
+ * engine is about to refuse at the HTTP layer.
+ */
+function validateSetting(
+  input: unknown,
+  index: number,
+  mirrors: unknown,
+  seenKeys: Set<string>,
+): string[] {
+  const errors: string[] = [];
+  const where = `Plugin manifest: 'settings[${index}]'`;
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    return [`${where} must be an object`];
+  }
+  const { key, type, default: fallback, label, description, options } =
+    input as Record<string, unknown>;
+
+  for (const field of Object.keys(input as Record<string, unknown>)) {
+    if (
+      !["key", "type", "default", "label", "description", "options"].includes(
+        field,
+      )
+    ) {
+      errors.push(`${where} has an unknown field '${field}'`);
+    }
+  }
+
+  if (!isValidStoreKey(key)) {
+    errors.push(
+      `${where}.key must be 1-64 characters of [A-Za-z0-9._-], starting with a letter or digit`,
+    );
+  } else if (seenKeys.has(key)) {
+    errors.push(`${where}.key '${key}' is declared more than once`);
+  } else {
+    seenKeys.add(key);
+  }
+
+  if (typeof type !== "string" || !SETTING_TYPES.has(type)) {
+    errors.push(
+      `${where}.type must be one of ${[...SETTING_TYPES].join(", ")}`,
+    );
+    return errors;
+  }
+
+  if (label !== undefined && typeof label !== "string") {
+    errors.push(`${where}.label must be a string`);
+  }
+  if (description !== undefined && typeof description !== "string") {
+    errors.push(`${where}.description must be a string`);
+  }
+
+  const validOptions =
+    options === undefined
+      ? undefined
+      : Array.isArray(options)
+        ? options
+        : null;
+  if (validOptions === null) {
+    errors.push(`${where}.options must be an array of strings`);
+  } else if (validOptions) {
+    if (type !== "select") {
+      errors.push(`${where}.options is only meaningful for type 'select'`);
+    }
+    if (validOptions.length < 2 || validOptions.length > MAX_SETTING_OPTIONS) {
+      errors.push(
+        `${where}.options must list 2-${MAX_SETTING_OPTIONS} values`,
+      );
+    }
+    validOptions.forEach((option, optionIndex) => {
+      if (typeof option !== "string" || option.length === 0) {
+        errors.push(`${where}.options[${optionIndex}] must be a non-empty string`);
+      }
+    });
+  }
+  if (type === "select" && !validOptions) {
+    errors.push(`${where}.options is required for type 'select'`);
+  }
+
+  if (fallback !== undefined) {
+    if (type === "string" && typeof fallback !== "string") {
+      errors.push(`${where}.default must be a string`);
+    } else if (type === "number") {
+      if (typeof fallback !== "number" || !Number.isFinite(fallback)) {
+        errors.push(`${where}.default must be a finite number`);
+      }
+    } else if (type === "boolean" && typeof fallback !== "boolean") {
+      errors.push(`${where}.default must be a boolean`);
+    } else if (
+      (type === "select" || type === "mirror") &&
+      typeof fallback !== "string"
+    ) {
+      errors.push(`${where}.default must be a string`);
+    }
+  }
+
+  if (type === "select" && typeof fallback === "string" && validOptions) {
+    if (!validOptions.includes(fallback)) {
+      errors.push(
+        `${where}.default '${fallback}' is not one of its own options`,
+      );
+    }
+  }
+
+  if (type === "mirror") {
+    const mirrorList = Array.isArray(mirrors) ? mirrors : [];
+    if (mirrorList.length === 0) {
+      errors.push(
+        `${where} is type 'mirror' but the manifest declares no 'mirrors'`,
+      );
+    } else if (typeof fallback === "string" && !mirrorList.includes(fallback)) {
+      errors.push(
+        `${where}.default '${fallback}' is not one of the manifest's declared mirrors`,
+      );
+    }
+  }
+
+  return errors;
 }
 
 /**
@@ -54,8 +207,18 @@ export function validateManifest(input: unknown): ManifestValidationResult {
     return { ok: false, errors: ["Plugin manifest: expected a JSON object"] };
   }
 
-  const { id, name, version, entry, author, description, domains, apiVersion } =
-    input;
+  const {
+    id,
+    name,
+    version,
+    entry,
+    author,
+    description,
+    domains,
+    apiVersion,
+    mirrors,
+    settings,
+  } = input;
   const errors: string[] = [];
 
   for (const field of Object.keys(input)) {
@@ -129,6 +292,31 @@ export function validateManifest(input: unknown): ManifestValidationResult {
     }
   }
 
+  if (mirrors !== undefined) {
+    if (!Array.isArray(mirrors)) {
+      errors.push("Plugin manifest: 'mirrors' must be an array of strings");
+    } else {
+      mirrors.forEach((mirror, index) => {
+        if (typeof mirror !== "string" || mirror.length === 0) {
+          errors.push(
+            `Plugin manifest: 'mirrors[${index}]' must be a non-empty string`,
+          );
+        }
+      });
+    }
+  }
+
+  if (settings !== undefined) {
+    if (!Array.isArray(settings)) {
+      errors.push("Plugin manifest: 'settings' must be an array of objects");
+    } else {
+      const seenKeys = new Set<string>();
+      settings.forEach((setting, index) => {
+        errors.push(...validateSetting(setting, index, mirrors, seenKeys));
+      });
+    }
+  }
+
   if (apiVersion !== undefined) {
     if (
       typeof apiVersion !== "number" ||
@@ -167,6 +355,12 @@ export function validateManifest(input: unknown): ManifestValidationResult {
   }
   if (typeof apiVersion === "number") {
     manifest.apiVersion = apiVersion;
+  }
+  if (Array.isArray(mirrors)) {
+    manifest.mirrors = mirrors as string[];
+  }
+  if (Array.isArray(settings)) {
+    manifest.settings = settings as PluginSetting[];
   }
 
   return { ok: true, manifest };

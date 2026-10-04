@@ -2,13 +2,51 @@
 
 Lightweight, cross-platform plugin engine for a future media/streaming application. This repository contains the **engine only** — no UI, browser automation, or media-player application.
 
-## Current status: v0.2.0 — Phases 1–6 complete + Phase 7 validation tooling
+## Current status: v0.4.0 — Phases 1–6 complete + Phase 7 validation tooling
 
 **Phases 1–6 are the production runtime and are complete.** Phase 7 is
 final validation and developer-only tooling (security regression, CLI
 end-to-end, and lifecycle/concurrency tests plus a benchmark harness); it
 adds no runtime capability. `ENGINE_PHASE` therefore stays **6**;
-`ENGINE_VERSION` is **0.2.0**. See the roadmap in `ARCHITECTURE.md`.
+`ENGINE_VERSION` is **0.4.0** and `ENGINE_API_VERSION` is **2**. See the
+roadmap in `ARCHITECTURE.md`.
+
+**v0.4.0 adds what the other plugin systems have — implemented from
+scratch, and faster.** Three ecosystems were studied for this release
+(Nuvio, SkyStream, Vega); the table and the measurements are below.
+
+- **`context.store`** — per-plugin persistent key-value storage with
+  declarative manifest `settings[]` and enforced `mirrors[]`. Reads are
+  **synchronous** and cost **~6.5 µs** because the store lives host-side;
+  writes persist once per capability call, not once per write.
+- **`PluginRegistry`** — a feed URL yields an installable catalog, and
+  integrity is **required**: sha256 verification plus an atomic
+  (stage-then-rename) install, which the repositories this is modelled on
+  do not do.
+- **`isLive`** — results can be flagged as continuous streams.
+- **`STANDARD_CAPABILITIES`** — one vocabulary (`home`, `search`,
+  `getDetails`, `getEpisodes`, `getSources`) that maps onto all three
+  ecosystems' naming.
+
+**v0.3.0 makes the engine app-ready and faster.** Results now carry what a
+player needs, many plugins run at once, and the sandbox boundary left the
+hot path:
+
+- **Playback metadata** — `format` (`mp4`, `m3u8`, `mpd`, …) and
+  `headers` (`Referer`/`User-Agent`) on results, `name`/`headers` on
+  subtitles. Validated like request headers (no CR/LF, denylisted
+  hop-by-hop names, bounded), because a player actually uses them.
+- **`PluginCoordinator`** — fan a capability across many plugins with
+  bounded concurrency, per-plugin error isolation, URL deduplication and
+  quality ranking. Against a source with 120 ms latency, 4 plugins
+  resolve **3.8x faster** than sequentially (494 ms → 129 ms per round).
+- **Per-plugin in-flight request cap** (default 8) — `Promise.all`
+  fan-out inside one plugin can no longer open unbounded sockets; the
+  surplus gets `HTTP_TOO_MANY_REQUESTS`.
+- **Plugin API v2: handle-based `context.html`** — only integers cross
+  the boundary, so `parse` is 6.5x, `select` 7x and `extract` 4.7x faster,
+  the ~500-level nesting limit is gone, and no untrusted document object
+  reaches the selector engine. `apiVersion: 1` plugins are unchanged.
 
 **v0.2.0 makes the engine enforce what a manifest declares.** A review of
 0.1.0 found that `domains` was validated and stored but never read — a
@@ -138,13 +176,27 @@ Requires Node.js >= 20.19 (the HTML parsing stack declares `>=20.19`).
 ```bash
 npm install
 npm run build
-npm test                                     # 246 tests, offline, deterministic
+npm test                                     # 316 tests, offline, deterministic
 npm run typecheck                            # tsc --noEmit (strict)
 npm run lint                                 # ESLint (type-aware)
 npm run plugins:list
 npm run plugin:run -- example.source test
 npm run plugins:validate -- plugins/example  # plugin-author check
 npm run bench                                # optional: developer-only benchmark harness
+```
+
+```js
+// Querying every installed source plugin at once (what an app does):
+import { PluginCoordinator, PluginRuntime, normalizeSourceResults } from "stream-plugin-engine";
+
+const runtime = new PluginRuntime();
+const coordinator = new PluginCoordinator(runtime, { concurrency: 4 });
+
+const loaded = [];                    // plugins you loaded earlier
+const { results, outcomes, stats } = await coordinator.collectSources(loaded, [query]);
+// results: merged, deduplicated (by URL), ranked by quality — trusted SourceResult[]
+// outcomes: per-plugin success/error + timings (one failure never fails the batch)
+// stats:    how many ran, how many produced results, duplicates removed
 ```
 
 `npm test` builds the TypeScript project first and then runs the built-in Node.js test runner.
@@ -456,7 +508,9 @@ The trusted, normalized result type is `SourceResult`:
 | `thumbnail` | string | no | absolute `http:`/`https:` URL; invalid values dropped |
 | `quality` | string | no | e.g. `1080p`; invalid/oversized values dropped |
 | `language` | string | no | e.g. `en`; invalid/oversized values dropped |
-| `subtitles` | `Array<{ url, language?, format? }>` | no | bounded list; entries with invalid URLs are dropped |
+| `format` | enum | no | `mp4 \| m3u8 \| mpd \| mkv \| webm \| ts \| other`; unknown values dropped — lets a player pick HLS vs progressive |
+| `headers` | `Record<string,string>` | no | playback headers (`Referer`, `User-Agent`); validated as request headers, denylisted names dropped |
+| `subtitles` | `Array<{ url, language?, format?, name?, headers? }>` | no | bounded list; entries with invalid URLs are dropped |
 | `metadata` | flat `Record<string, string \| number \| boolean>` | no | always present (empty object when absent); bounded |
 
 Unknown fields are dropped. Numbers must be finite. The output is always
@@ -513,6 +567,12 @@ array).
 | `language` length | 20 characters |
 | Subtitle `format` length | 30 characters |
 | Subtitles per result | 50 |
+| Playback headers per result / per subtitle | 16 |
+| Store keys per plugin | 256 |
+| Store key length / value size / total size | 64 chars / 4 KiB / 64 KiB |
+| Store value nesting depth | 8 |
+| Declared settings per plugin | unlimited (each validated; `select` options 2–16) |
+| Playback header name / value length | 64 / 2,048 characters |
 | Metadata keys per result | 64 |
 | Metadata key length | 100 characters |
 | Metadata string value length | 500 characters |
@@ -556,6 +616,221 @@ node dist/src/cli.js validate <pluginDir | manifest.json>
   plugin would not load.
 - `--plugins-dir` makes `list` and `run` independent of the current working
   directory.
+
+## Compared with Nuvio, SkyStream and Vega (v0.4.0)
+
+Three provider ecosystems, and what each of their plugin systems does —
+followed by where this engine stands. Nothing below was copied from them:
+the interfaces were studied, and every implementation here is this repo's
+own code.
+
+| Capability | Nuvio | SkyStream | Vega | This engine |
+| --- | --- | --- | --- | --- |
+| Sandbox | in-app Hermes | QuickJS | in-app Hermes (injected `axios`/`cheerio`) | QuickJS/Wasm, per-plugin heap + deadline |
+| HTML parsing | cheerio in-guest | QuickJS + cheerio | cheerio in-guest | handle-based capability: **tree never enters the guest** |
+| Persistent storage | settings | `getPreference`/`setPreference` | `kvStore` (async per call) | `context.store` — **sync reads, one persist per call** |
+| Declarative settings | ✅ | ✅ | ✅ (settings modal) | ✅ `settings[]` with validated `select`/`mirror` types |
+| Mirrors / sub-providers | — | ✅ `baseUrl` mirrors, sub-providers | ✅ custom mirror setting | ✅ `mirrors[]`, **enforced** as part of the HTTP allowlist |
+| Distribution | paste a raw URL | `repo.json` → `plugins.json`, `.sky` bundles | repo `manifest.json` | `PluginRegistry` feed + **required sha256**, atomic install |
+| Integrity check on install | — | — | — | ✅ hash + manifest↔feed agreement, verified before any write |
+| Network policy | app-level | — | injected `axios`, no engine policy | SSRF policy on **every hop**, enforced manifest domains |
+| Per-plugin request cap | — | — | — | ✅ (default 8), structured refusal |
+| Timeout / memory limits | — | — | — | ✅ per plugin |
+| Parallel multi-plugin query | — | — | — | ✅ `PluginCoordinator` (**3.9x** on latency-bound sources) |
+| Result validation | app-side | app-side | app-side | ✅ normalized + validated before an app ever sees it |
+| Playback metadata (`format`, headers) | partial | partial | partial | ✅ validated, denylisted headers |
+| Live stream flag | — | ✅ live streams | — | ✅ `isLive` |
+| Cancellation | — | — | ✅ `signal` in scrapers | ✅ `AbortSignal` per call + per fan-out |
+
+Where this engine is deliberately *outside* these systems' scope: it does
+not solve CAPTCHAs, bypass Cloudflare or DRM, or play/download media. It
+produces validated, playable **results** and lets the application own the
+player.
+
+### The measurements behind "faster"
+
+`npm run bench`, one machine, same fixtures — the full runs are checked in
+under `benchmarks/` (`v0.3.0.txt`, `v0.4.0.txt`):
+
+| Work | v1 style (tree/in-guest parse) | ours | Speed-up |
+| --- | --- | --- | --- |
+| `html.parse` of a 20-item page | 3.28 ms | 0.50 ms | 6.5x |
+| `html.select` | 5.54 ms | 0.78 ms | 7.1x |
+| `html.extract` x20 | 8.63 ms | 1.82 ms | 4.7x |
+| 4 source plugins, 120 ms provider latency | 493 ms sequential | 127 ms | 3.9x |
+| one store read | ~290 µs (one host round trip — what an async bridge pays per read) | 6.5 µs | ~45x |
+| 10 store writes + persist | — | 0.45 ms (one save, not ten) | — |
+
+The HTML numbers are the structural difference: a tree-based API (what the
+other three use) serializes the document into the guest and the matched
+nodes back out on every call; the handle API passes integers. The store
+number is the same argument applied to persistence: the values are already
+in host memory, so a read is a lookup rather than a bridge crossing.
+
+## Multi-plugin fan-out (v0.3.0)
+
+The runtime executes one capability on one plugin (operations on a single
+plugin are serialized on purpose). An application wants the opposite: query
+every installed source plugin for a title, then merge. `PluginCoordinator`
+owns that policy.
+
+```js
+const coordinator = new PluginCoordinator(runtime, { concurrency: 4 }); // default 4
+const merged = await coordinator.collectSources(loadedPlugins, [query]);
+
+merged.results;   // SourceResult[] — merged, deduplicated by canonical URL, ranked
+merged.outcomes;  // per plugin: { pluginId, ok, error?, executionTimeMs, normalized }
+merged.stats;     // { pluginsRun, pluginsSucceeded, pluginsFailed,
+                  //   resultsPerPlugin, duplicatesRemoved, totalResults }
+```
+
+- **Bounded**: at most `concurrency` plugins execute at once (each has its
+  own sandbox and Wasm heap).
+- **Isolated**: one plugin failing — or returning garbage that fails
+  normalization — never fails the batch; the error is reported per plugin.
+- **Deterministic**: outcomes follow the caller's plugin order, and results
+  are sorted by quality (`qualityScore`), then title, then URL.
+- **Honest about speed**: fan-out overlaps *waiting*, not CPU. Measured
+  (`npm run bench`): 4 plugins against a 120 ms-latency source go from
+  494 ms to 129 ms per round (**3.8x**); against a zero-latency loopback
+  fixture there is nothing to overlap, so it is ~1.2x.
+- **Cancellable**: pass an `AbortSignal` to stop plugins that have not
+  started yet (in-flight operations keep their own runtime deadline).
+
+A plugin can also fan out *inside* one call — bounded by
+`http.maxInFlightPerPlugin` (default 8), which returns a structured
+`HTTP_TOO_MANY_REQUESTS` for the surplus instead of opening more sockets.
+
+## Per-plugin storage and settings (v0.4.0)
+
+```js
+// Inside a plugin — synchronous reads, no await:
+export const plugin = {
+  async sources(context) {
+    const host = context.store.get("baseUrl", "cdn.example"); // settings default
+    const prefer = context.store.get("quality", "auto");
+    context.store.set("lastRunAt", new Date().toISOString()); // persisted at call end
+    const seen = context.store.get("seen", []);
+    return [{ id: "1", title: "…", type: "source", url: `https://${host}/watch/1` }];
+  },
+};
+```
+
+```json
+// manifest.json — the schema an application renders as UI:
+{
+  "id": "acme.sources", "name": "Acme", "version": "1.0.0", "entry": "plugin.js",
+  "domains": ["cdn.example"],
+  "mirrors": ["cdn.example", "mirror.example"],
+  "settings": [
+    { "key": "baseUrl", "type": "mirror", "default": "cdn.example", "label": "Mirror" },
+    { "key": "quality", "type": "select", "default": "auto", "options": ["auto", "1080p", "720p"] },
+    { "key": "apiKey",  "type": "string" },
+    { "key": "live",    "type": "boolean", "default": false }
+  ]
+}
+```
+
+Rules the engine enforces, so an application never has to:
+
+- **Reads are synchronous** and cost ~6.5 µs; the store is loaded once per
+  plugin and lives host-side.
+- **One persist per capability call** — 200 writes cost one save.
+- **Quotas** (per plugin): 256 keys, 64 characters per key, 4 KiB per
+  value, 64 KiB total, depth 8. Exceeding them is a structured
+  `STORE_QUOTA_EXCEEDED`/`STORE_INVALID_VALUE`, never silent truncation.
+- **Values are deep-copied** through a JSON round trip; `__proto__`,
+  `constructor` and `prototype` are refused as keys and anywhere inside a
+  value. Guest functions are refused (they would otherwise be stored as
+  their own source text).
+- **A `mirror` setting can only hold one of the declared `mirrors`**, and
+  `mirrors` + `domains` together form the enforced HTTP allowlist.
+- **`context.store` is removable**: `{ permissions: { store: false } }`
+  deletes the capability, so a pure-computation plugin cannot leave data
+  behind.
+
+Storage itself is a host decision:
+
+```js
+// In-memory by default (values live for the runtime's lifetime):
+const runtime = new PluginRuntime();
+
+// Persistent: implement StoreBackend (load/save) however your app likes.
+const runtime2 = new PluginRuntime({ storeBackend: myFileBackedBackend });
+```
+
+A backend failure never breaks a plugin: the plugin still runs, keeps its
+in-memory values, and the host is told once through the logger
+(`STORE_BACKEND_ERROR`). The store stays dirty so the next call retries.
+
+## Installing plugins from a registry (v0.4.0)
+
+```js
+const registry = new PluginRegistry();           // uses the engine HttpClient
+const feed = await registry.load("https://example.test/registry.json");
+if (feed.ok) {
+  const updates = registry.checkUpdates(installedManifests); // semver-aware
+  const installed = await registry.install("acme.sources", "./plugins");
+  // → ./plugins/acme.sources/{manifest.json,plugin.js}
+}
+```
+
+```json
+{
+  "format": "stream-plugin-engine-registry",
+  "version": 1,
+  "name": "Example registry",
+  "plugins": [
+    {
+      "id": "acme.sources",
+      "name": "Acme Sources",
+      "version": "1.2.0",
+      "url": "https://example.test/acme/plugin.js",
+      "manifestUrl": "https://example.test/acme/manifest.json",
+      "sha256": "9f2c…64 lowercase hex…",
+      "apiVersion": 2,
+      "tags": ["movies"]
+    }
+  ]
+}
+```
+
+- **Integrity is required.** No `sha256`, no install. The downloaded bytes
+  must hash to it, and the manifest must agree with the feed on id **and**
+  version. All of this happens **before** anything touches the filesystem.
+- **Installs are atomic**: written to a staging directory and renamed into
+  place, so an interrupted install cannot leave a partial plugin for the
+  loader to execute.
+- **Registry traffic uses the engine `HttpClient`**, so host network
+  policy, size caps and timeouts apply — verified in the test suite by
+  watching the default policy refuse a loopback feed.
+- **`checkUpdates` uses real semver ordering** (`1.0.0-rc.1` < `1.0.0`).
+
+## Choosing a plugin API version (v0.3.0)
+
+| Manifest | `context.html` | Boundary traffic | Use when |
+| --- | --- | --- | --- |
+| `apiVersion: 1` (or absent) | `parse` → document tree, `select` → element nodes, `extract(element)` | whole tree in, matched nodes back out | existing plugins; nothing to change |
+| `apiVersion: 2` | `parse` → number, `select` → number[], `extract(handle)` | integers both ways | new plugins; several times faster, no depth limit |
+
+```js
+// apiVersion: 2
+const doc = context.html.parse(html);          // → 3
+const items = context.html.select(doc, ".item"); // → [4, 5, 6]
+const first = context.html.extract(items[0]);  // → { tagName, text, href, ... }
+```
+
+Handles are valid for **one capability call**: storing one on the plugin
+object and reusing it later fails with `HTML_STALE_HANDLE`. Values from
+`context.json` are unaffected (they never crossed the boundary anyway).
+
+Measured on a 20-item catalog page (`npm run bench`):
+
+| Capability | v1 (tree) | v2 (handles) | Speed-up |
+| --- | --- | --- | --- |
+| `html.parse` | 3.28 ms | 0.50 ms | 6.5x |
+| `html.select` | 5.54 ms | 0.78 ms | 7.1x |
+| `html.extract` x20 | 8.63 ms | 1.82 ms | 4.7x |
 
 ## Dependencies
 
@@ -642,7 +917,7 @@ v0.2.0 adds the enforcement layer:
 Run:
 
 ```bash
-npm test        # correctness suite (246 tests, offline, deterministic)
+npm test        # correctness suite (316 tests, offline, deterministic)
 npm run typecheck
 npm run lint
 npm run bench   # developer-only benchmarks — NOT part of the test suite

@@ -17,15 +17,17 @@ import {
 
 test("foundation compiles and exports engine identity", () => {
   assert.equal(ENGINE_NAME, "stream-plugin-engine");
-  // 0.2.0 adds enforced manifest domains, capability permissions,
-  // apiVersion, and engine-owned enable/disable. No runtime phase change.
-  assert.equal(ENGINE_VERSION, "0.2.0");
+  // 0.3.0 adds playback metadata on results (format + headers), the
+  // multi-plugin coordinator, the per-plugin in-flight request cap, and
+  // the handle-based html capability (engine API version 2).
+  assert.equal(ENGINE_VERSION, "0.4.0");
   // Regression: the engine reports the FINAL phase (Phase 6).
   assert.equal(ENGINE_PHASE, 6);
 });
 
 test("plugin API version and domain-policy helpers are exported", () => {
-  assert.equal(ENGINE_API_VERSION, 1);
+  // API version 2 = handle-based html capability (see src/manifest.ts).
+  assert.equal(ENGINE_API_VERSION, 2);
   assert.equal(typeof engine.normalizeDomainPattern, "function");
   assert.equal(typeof engine.domainPatternMatches, "function");
   assert.equal(typeof engine.isHostAllowed, "function");
@@ -124,4 +126,39 @@ test("public API surface is complete and stable (Phase 1-6)", () => {
   assert.ok(Array.isArray(engine.SOURCE_RESULT_TYPES));
   // Phase 1 (well-known capability names).
   assert.ok(Array.isArray(engine.KNOWN_CAPABILITIES));
+  // v0.3.0: multi-plugin fan-out and the playback-metadata vocabulary.
+  assert.equal(typeof engine.PluginCoordinator, "function");
+  assert.equal(typeof engine.qualityScore, "function");
+  assert.ok(Array.isArray(engine.SOURCE_RESULT_FORMATS));
+  // v0.4.0: per-plugin storage, distribution, and the standard capability set.
+  assert.equal(typeof engine.PluginStore, "function");
+  assert.equal(typeof engine.MemoryStoreBackend, "function");
+  assert.equal(typeof engine.createPluginStore, "function");
+  assert.equal(typeof engine.PluginRegistry, "function");
+  assert.equal(typeof engine.validateRegistryFeed, "function");
+  assert.equal(typeof engine.compareVersions, "function");
+  assert.ok(Array.isArray(engine.STANDARD_CAPABILITIES));
+  assert.ok(Array.isArray(engine.STORE_ERROR_CODES));
+  assert.ok(engine.STORE_LIMITS);
+});
+
+test("v0.3.0 exposes the coordinator on its own subpath", async () => {
+  // The exports map in package.json promises ./coordinator; the built
+  // module must exist and be usable on its own.
+  const { PluginCoordinator, qualityScore } = await import("stream-plugin-engine/coordinator");
+  assert.equal(typeof PluginCoordinator, "function");
+  assert.equal(typeof qualityScore, "function");
+  assert.equal(PluginCoordinator, engine.PluginCoordinator);
+});
+
+test("v0.4.0 exposes store and registry on their own subpaths", async () => {
+  const store = await import("stream-plugin-engine/store");
+  assert.equal(typeof store.PluginStore, "function");
+  assert.equal(typeof store.MemoryStoreBackend, "function");
+  assert.equal(store.PluginStore, engine.PluginStore);
+
+  const registry = await import("stream-plugin-engine/registry");
+  assert.equal(typeof registry.PluginRegistry, "function");
+  assert.equal(typeof registry.validateRegistryFeed, "function");
+  assert.equal(registry.PluginRegistry, engine.PluginRegistry);
 });

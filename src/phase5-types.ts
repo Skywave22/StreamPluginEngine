@@ -74,3 +74,68 @@ export interface PluginHtml {
     outerHTML: string;
   };
 }
+
+/**
+ * `context.html` for plugins whose manifest declares `apiVersion: 2`
+ * (or higher, up to the engine's ENGINE_API_VERSION).
+ *
+ * The document tree stays HOST-SIDE; the guest only ever handles opaque
+ * numeric handles. This is the fast path:
+ *
+ * ```js
+ * const doc = context.html.parse(html);      // → 3      (document handle)
+ * const items = context.html.select(doc, ".item"); // → [4, 5] (element handles)
+ * const first = context.html.extract(items[0]);    // → info object
+ * ```
+ *
+ * Why it is faster: version 1 serialized the whole tree into the guest
+ * and serialized matched nodes back out on every call, so the Wasm
+ * boundary — not the parser — dominated. Handles make each call's
+ * payload a few integers.
+ *
+ * Behaviour differences from version 1, all deliberate:
+ * - Handles are valid for the duration of ONE capability call. Storing
+ *   one on the plugin object and reusing it in a later call fails with
+ *   `{ code: "HTML_STALE_HANDLE" }` — handles are not cross-operation
+ *   state.
+ * - A handle table is bounded (PHASE5_LIMITS.maxHtmlHandles per call);
+ *   exceeding it fails with `HTML_HANDLE_LIMIT`.
+ * - Nesting depth is no longer limited to ~500 levels, because no value
+ *   is delivered into the guest.
+ * - `select`/`extract` no longer accept hand-built document/element
+ *   objects; only handles produced by this API.
+ *
+ * Error contract is unchanged: synchronous return on success, a REJECTED
+ * promise carrying a structured `{ code, message }` object on failure.
+ */
+export interface PluginHtml2 {
+  /**
+   * Parse a bounded HTML string (5 MiB, 50 000 nodes) and return a
+   * numeric document handle. Errors: `HTML_INVALID_INPUT`,
+   * `HTML_INPUT_TOO_LARGE`, `HTML_PARSE_ERROR`, `HTML_HANDLE_LIMIT`.
+   */
+  parse(html: string): number;
+  /**
+   * Select elements matching a CSS selector inside a document (or
+   * element) handle. Returns numeric element handles (at most 1 000).
+   * Errors: `HTML_INVALID_SELECTOR`, `HTML_SELECT_ERROR`,
+   * `HTML_TOO_MANY_RESULTS`, `HTML_STALE_HANDLE`, `HTML_HANDLE_LIMIT`.
+   */
+  select(documentHandle: number, selector: string): number[];
+  /**
+   * Return the normalized info object for an element handle. Errors:
+   * `HTML_INVALID_ELEMENT`, `HTML_EXTRACT_ERROR`, `HTML_STALE_HANDLE`.
+   */
+  extract(elementHandle: number): {
+    tagName: string;
+    text: string;
+    attributes: Record<string, string>;
+    href?: string;
+    src?: string;
+    class?: string;
+    id?: string;
+    data: Record<string, string>;
+    innerHTML: string;
+    outerHTML: string;
+  };
+}

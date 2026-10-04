@@ -450,6 +450,146 @@ pipeline, or the sandbox isolation model. Error codes, limits, and the
 "engine-authored messages only" rule continue to apply to the new
 `HTTP_DOMAIN_NOT_ALLOWED` path.
 
+### v0.3.0 — App-readiness and the boundary fast path (no new phase)
+
+Three changes, all in service of one question: *can an application play
+what this engine returns, and can it ask many plugins at once?*
+
+**1. Playback metadata is now part of the trusted result.**
+`SourceResult` gained `format` (closed container/playlist enum) and
+`headers`; subtitles gained `name` and `headers`. This is a deliberate
+exception to "results are inert data": an application hands these to a
+player, so they are validated the way request headers are (token names,
+CR/LF/NUL rejected, bounded count/length, hop-by-hop and request-forging
+names denylisted). The engine still never fetches or plays a result URL.
+Rationale: a resolved media URL without its `Referer` is not playable,
+which made the Phase 6 model unusable for real sources.
+
+**2. `PluginCoordinator` owns multi-plugin fan-out.**
+The runtime serializes operations on ONE plugin (a QuickJS runtime has a
+single interrupt slot and job queue). The coordinator adds the missing
+scheduling layer *outside* the runtime:
+
+```
+Application
+    ↓  coordinator.collectSources(plugins, args)
+PluginCoordinator        bounded concurrency, per-plugin isolation,
+    ↓                    deterministic ordering
+PluginRuntime.execute(plugin, "sources", args)      ← unchanged
+    ↓
+normalizeSourceResults(value)   ← per plugin, so one bad plugin
+    ↓                             cannot spoil the merged list
+merge → dedupe by canonical URL → rank by quality → SourceResult[]
+```
+
+It is host-side policy only: it performs no I/O and executes no guest
+code itself, and it accepts any `PluginExecutor`, so an application can
+wrap or stub the runtime. Bounded by `concurrency` (default 4); one
+plugin's failure, timeout, or invalid output is reported per plugin and
+never fails the batch. Speed is claimed only where it is real: fan-out
+overlaps *waiting*, measured at 3.8x for 4 plugins against a 120 ms
+source, and ~1.2x against a zero-latency loopback fixture.
+
+**3. The sandbox boundary left the HTML hot path (plugin API v2).**
+Version 1 shipped the parsed document INTO the guest and serialized
+matched nodes back OUT on every call, so the Wasm boundary dominated:
+`select` cost ~5.5 ms of which the parser was ~0.3 ms. Version 2 keeps
+the tree in `LoadedPluginHandle.htmlHandles` and crosses integers:
+
+```
+v1:  html.parse(html)            host → guest : entire document tree
+     html.select(doc, sel)       guest → host : tree again
+                                 host → guest : matched element nodes
+     html.extract(el)            guest → host : element again
+
+v2:  html.parse(html)     → id    (a number)
+     html.select(id, sel) → id[]  (numbers)
+     html.extract(id)     → info  (a small object)
+```
+
+Consequences beyond speed (6.5x / 7.1x / 4.7x measured): no value is
+delivered into the guest for HTML work, so the ~500-level nesting limit
+disappears; hand-built document objects can no longer be fed to the
+selector engine; and the handle table is bounded per call
+(`PHASE5_LIMITS.maxHtmlHandles`) and cleared when the call ends — which
+is what makes `HTML_STALE_HANDLE` a structured answer rather than a
+cross-call surprise. `ENGINE_API_VERSION` is 2; the runtime selects the
+implementation per plugin from the manifest's `apiVersion`, so v1
+plugins behave exactly as before.
+
+**What did NOT change:** no new phase (`ENGINE_PHASE` stays 6), no
+guest-visible capability beyond the v2 html surface, the same permission,
+domain, SSRF, timeout, memory and result limits, and the same rule that
+every error a plugin can observe is engine-authored.
+
+### v0.4.0 — Storage, settings, distribution (no new phase)
+
+The three reference ecosystems were studied for this release. Two
+conclusions shaped it: they all give plugins **persistence** (and we did
+not), and none of them verify what they install.
+
+**1. `context.store` — persistence without a bridge crossing.**
+
+```
+guest: context.store.get(key)          → host map lookup        (no Wasm traffic)
+guest: context.store.set(key, value)   → validate + write in place
+end of capability call                 → ONE backend.save() for everything written
+```
+
+```
+PluginRuntime
+   ├─ handle.store : PluginStore          ← loaded once at plugin load
+   │    ├─ values (host-side map)         ← reads are local
+   │    ├─ defaults (manifest settings)   ← visible before any write
+   │    └─ dirty flag                     ← cleared only after a successful save
+   └─ storeBackend : StoreBackend         ← in-memory default, injectable
+```
+
+The alternative design — `await store.get()` crossing the boundary per
+read — is what an injected async KV API costs. Measured here: a read is
+~6.5 µs, while one host round trip is ~290 µs.
+
+Persisted data is untrusted input on the way back in: every entry is
+re-validated at load, and anything that fails (bad key, oversized value,
+forbidden key, wrong shape) is DROPPED rather than surfaced. A store that
+returns garbage is worse than one that returns nothing.
+
+**2. `settings[]` + `mirrors[]` — declared configuration, enforced.**
+
+Settings exist so an application can render UI for a plugin it has never
+seen. The engine's job is the part a UI cannot do:
+
+- a `select` default must be one of its own options;
+- a `mirror` default (and every later write to that key) must be one of
+  the manifest's declared `mirrors`;
+- `mirrors` themselves join the ENFORCED allowlist next to `domains`.
+
+So "user picks a mirror" cannot become "plugin talks to an undeclared
+host": the write is refused by the store, and the HTTP layer refuses the
+host anyway.
+
+**3. `PluginRegistry` — distribution with a hostile-server assumption.**
+
+```
+feed URL ──► validateRegistryFeed()   (format marker + version + every field)
+                     │
+        install(id) ─┴─► fetch entry ─► sha256 == feed.sha256 ?  ── no ──► REFUSE
+                         fetch manifest ─► valid + id/version agree? ─ no ─► REFUSE
+                     │
+                     └─► write to .install-<id>-<pid>-<t>  ─► rename() ─► ./<id>
+```
+
+Fetch → verify → write, in that order, with nothing written on failure and
+a staging directory that makes the final step atomic. The registry is a
+pure host-side module: it runs no guest code, and its network access goes
+through the same `HttpClient` the plugins use, so host policy applies.
+
+**What did NOT change:** no new phase (`ENGINE_PHASE` stays 6),
+`ENGINE_API_VERSION` stays **2** (store and `isLive` are additive —
+existing plugins are unaffected and the version gate keeps meaning "needs
+a contract this engine does not implement"), and the same permission,
+domain, SSRF, timeout, memory and result limits.
+
 ## Planned plugin entry-point types (not implemented)
 
 - Search

@@ -127,6 +127,8 @@ export const plugin = {
       hasHttp: typeof context.http,
       hasJson: typeof context.json,
       hasHtml: typeof context.html,
+      hasStore: typeof context.store,
+      storeKeys: context.store ? Object.keys(context.store).sort() : null,
       httpKeys: context.http ? Object.keys(context.http).sort() : null,
       manifestId: context.manifest.id,
     };
@@ -160,17 +162,21 @@ export const plugin = {
 // Capability permissions
 // ---------------------------------------------------------------------------
 
-test("permissions: the default surface is unchanged (http + json + html)", async (t) => {
+test("permissions: the default surface is http + json + html + store", async (t) => {
   const fixture = await setup(t, { source: SURFACE_SOURCE });
   const value = (await run(fixture, "surface")) as Record<string, unknown>;
-  assert.deepEqual(value.keys, ["html", "http", "json", "log", "manifest"]);
+  assert.deepEqual(value.keys, ["html", "http", "json", "log", "manifest", "store"]);
   assert.deepEqual(value.httpKeys, ["get", "getJson", "request"]);
   assert.equal(value.hasHttp, "object");
+  // v0.4.0: the store surface is exactly these verbs, nothing more.
+  assert.deepEqual(value.storeKeys, ["all", "delete", "get", "has", "keys", "set"]);
+  assert.equal(value.hasStore, "object");
   // Introspection: the engine records what it granted.
   assert.deepEqual(fixture.loaded.permissions, {
     http: true,
     json: true,
     html: true,
+    store: true,
   });
 });
 
@@ -181,15 +187,17 @@ test("permissions: http:false removes the network surface entirely", async (t) =
   });
   const value = (await run(fixture, "surface")) as Record<string, unknown>;
   // Not "a function that throws" — the capability is absent.
-  assert.deepEqual(value.keys, ["html", "json", "log", "manifest"]);
+  assert.deepEqual(value.keys, ["html", "json", "log", "manifest", "store"]);
   assert.equal(value.hasHttp, "undefined");
   assert.equal(value.httpKeys, null);
-  // The other capabilities still work.
+  // The other capabilities still work, store included.
   assert.equal(await run(fixture, "parseOk"), "hi");
+  assert.equal(value.hasStore, "object");
   assert.deepEqual(fixture.loaded.permissions, {
     http: false,
     json: true,
     html: true,
+    store: true,
   });
 });
 
@@ -200,7 +208,7 @@ test("permissions: json:false / html:false remove only that capability", async (
     dirName: "nojson",
   });
   const noJsonValue = (await run(noJson, "surface")) as Record<string, unknown>;
-  assert.deepEqual(noJsonValue.keys, ["html", "http", "log", "manifest"]);
+  assert.deepEqual(noJsonValue.keys, ["html", "http", "log", "manifest", "store"]);
   assert.equal(noJsonValue.hasJson, "undefined");
   assert.equal(await run(noJson, "parseOk"), "hi");
 
@@ -210,7 +218,7 @@ test("permissions: json:false / html:false remove only that capability", async (
     dirName: "nohtml",
   });
   const noHtmlValue = (await run(noHtml, "surface")) as Record<string, unknown>;
-  assert.deepEqual(noHtmlValue.keys, ["http", "json", "log", "manifest"]);
+  assert.deepEqual(noHtmlValue.keys, ["http", "json", "log", "manifest", "store"]);
   assert.equal(noHtmlValue.hasHtml, "undefined");
   assert.equal(await run(noHtml, "jsonOk"), 1);
 });
@@ -224,13 +232,14 @@ test("permissions: a per-plugin override wins over the runtime default", async (
     },
   });
   const value = (await run(fixture, "surface")) as Record<string, unknown>;
-  assert.deepEqual(value.keys, ["html", "json", "log", "manifest"]);
+  assert.deepEqual(value.keys, ["html", "json", "log", "manifest", "store"]);
   assert.equal(value.hasHtml, "object");
   assert.equal(value.hasHttp, "undefined");
   assert.deepEqual(fixture.loaded.permissions, {
     http: false,
     json: true,
     html: true,
+    store: true,
   });
 });
 
@@ -580,7 +589,7 @@ test("apiVersion: validated against the engine's implemented version", () => {
     version: "1.0.0",
     entry: "plugin.js",
   };
-  assert.equal(ENGINE_API_VERSION, 1);
+  assert.equal(ENGINE_API_VERSION, 2);
 
   // Absent → accepted, and not injected into the manifest.
   const absent = validateManifest({ ...base });
@@ -592,8 +601,16 @@ test("apiVersion: validated against the engine's implemented version", () => {
   assert.ok(one.ok);
   assert.equal(one.manifest.apiVersion, 1);
 
+  // Version 2 IS implemented (handle-based html capability).
+  const two = validateManifest({ ...base, apiVersion: 2 });
+  assert.ok(two.ok);
+  assert.equal(two.manifest.apiVersion, 2);
+
   // A newer version than the engine implements → rejected loudly.
-  const future = validateManifest({ ...base, apiVersion: 2 });
+  const future = validateManifest({
+    ...base,
+    apiVersion: ENGINE_API_VERSION + 1,
+  });
   assert.equal(future.ok, false);
   assert.ok(!future.ok);
   assert.match(future.errors.join("\n"), /apiVersion.*not supported/i);

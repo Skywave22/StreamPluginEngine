@@ -12,7 +12,7 @@
  */
 
 export const ENGINE_NAME = "stream-plugin-engine";
-export const ENGINE_VERSION = "0.2.0";
+export const ENGINE_VERSION = "0.4.0";
 /**
  * The engine's PRODUCTION RUNTIME capability level: Phase 6 (normalized
  * source result pipeline) is the last phase that adds runtime behaviour.
@@ -85,29 +85,82 @@ export type {
   HtmlElementInfo,
 } from "./phase5.js";
 
-export type { PluginJson, PluginHtml } from "./phase5-types.js";
+export type { PluginJson, PluginHtml, PluginHtml2 } from "./phase5-types.js";
 
 export {
   RESULT_LIMITS,
   RESULT_ERROR_CODES,
+  SOURCE_RESULT_FORMATS,
   SOURCE_RESULT_TYPES,
   normalizeSourceResults,
 } from "./results.js";
 
 export type {
+  PlaybackHeaders,
   ResultErrorCode,
   ResultErrorObject,
   SourceResult,
+  SourceResultFormat,
   SourceResultType,
   SourceResultValidationResult,
   SourceSubtitle,
 } from "./results.js";
 
+export { PluginCoordinator, qualityScore } from "./coordinator.js";
+
+export type {
+  CollectSourcesResult,
+  FanOutStats,
+  PluginCoordinatorOptions,
+  PluginExecutor,
+  PluginRunOutcome,
+} from "./coordinator.js";
+
+export {
+  createPluginStore,
+  isValidStoreKey,
+  MemoryStoreBackend,
+  PluginStore,
+  sanitizeStoreValue,
+  settingsDefaults,
+  STORE_ERROR_CODES,
+  STORE_LIMITS,
+} from "./store.js";
+export type {
+  StoreBackend,
+  StoreError,
+  StoreErrorCode,
+} from "./store.js";
+
+export {
+  compareVersions,
+  PluginRegistry,
+  REGISTRY_ERROR_CODES,
+  REGISTRY_FEED_FORMAT,
+  REGISTRY_FEED_VERSION,
+  sha256Hex,
+  validateRegistryFeed,
+} from "./registry.js";
+export type {
+  InstalledPlugin,
+  PluginRegistryOptions,
+  RegistryError,
+  RegistryErrorCode,
+  RegistryFeed,
+  RegistryFeedValidation,
+  RegistryFetch,
+  RegistryPluginEntry,
+  RegistryUpdate,
+} from "./registry.js";
+
 export type {
   KnownCapability,
+  PluginSetting,
+  StandardCapability,
   ManifestValidationResult,
   Plugin,
   PluginContext,
+  PluginContextV2,
   PluginExecutionResult,
   PluginHttp,
   PluginLoadResult,
@@ -120,5 +173,5 @@ export type {
   ResolvedPluginPermissions,
 } from "./types.js";
 
-export { KNOWN_CAPABILITIES } from "./types.js";
+export { KNOWN_CAPABILITIES, STANDARD_CAPABILITIES } from "./types.js";
 export type { LoadedPlugin } from "./types.js";
